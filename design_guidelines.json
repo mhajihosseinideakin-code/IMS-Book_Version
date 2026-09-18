@@ -1,0 +1,311 @@
+{
+  "theme": "dark",
+  "archetype": "SWISS & HIGH-CONTRAST / TACTICAL MINIMALISM (Scientific Engineering & Precision Instrumentation)",
+  "rationale": "The IMS Platform is a serious numerical-analysis and control-theory research platform. The visual tone must evoke high-precision laboratory instruments (oscilloscopes, spectrum analyzers, control-system workbenches) while remaining welcoming and exploratory for academic researchers and students. High-contrast dark theme with sharp borders, dense structured layout, ISO/standard scientific metric notations, interactive formula tooltips, and crystal-clear semantic color coding for mathematical claim levels ensures readability and zero ambiguity between mathematical identities and empirical simulations.",
+  "colors": {
+    "surfaces": [
+      {
+        "name": "page",
+        "kind": "solid",
+        "bg": "#0B0E14",
+        "on_bg": "#F1F5F9",
+        "on_bg_muted": "#94A3B8",
+        "roles": {
+          "border": "#1E293B",
+          "border_active": "#334155",
+          "link": "#38BDF8",
+          "error": "#F87171",
+          "success": "#34D399"
+        }
+      },
+      {
+        "name": "panel",
+        "kind": "solid",
+        "bg": "#111827",
+        "on_bg": "#F8FAFC",
+        "on_bg_muted": "#94A3B8",
+        "roles": {
+          "border": "#1F2937",
+          "border_highlight": "#374151"
+        }
+      },
+      {
+        "name": "panel_secondary",
+        "kind": "solid",
+        "bg": "#0F172A",
+        "on_bg": "#F8FAFC",
+        "on_bg_muted": "#64748B",
+        "roles": {
+          "border": "#1E293B"
+        }
+      },
+      {
+        "name": "inverse",
+        "kind": "solid",
+        "bg": "#F8FAFC",
+        "on_bg": "#0B0E14",
+        "on_bg_muted": "#475569"
+      },
+      {
+        "name": "claim_level_exact_identity",
+        "kind": "solid",
+        "bg": "#14291E",
+        "on_bg": "#6EE7B7",
+        "on_bg_muted": "#A7F3D0",
+        "roles": {
+          "border": "#059669",
+          "badge_bg": "#064E3B",
+          "label": "Ideal Contraction / Exact Identity"
+        }
+      },
+      {
+        "name": "claim_level_local_stability",
+        "kind": "solid",
+        "bg": "#0C2340",
+        "on_bg": "#7DD3FC",
+        "on_bg_muted": "#BAE6FD",
+        "roles": {
+          "border": "#0284C7",
+          "badge_bg": "#075985",
+          "label": "Local Asymptotic Stability (Jacobian/RH)"
+        }
+      },
+      {
+        "name": "claim_level_observed_recovery",
+        "kind": "solid",
+        "bg": "#291E0A",
+        "on_bg": "#FCD34D",
+        "on_bg_muted": "#FDE68A",
+        "roles": {
+          "border": "#D97706",
+          "badge_bg": "#78350F",
+          "label": "Observed Numerical Recovery (Simulation)"
+        }
+      },
+      {
+        "name": "claim_level_certified_regional",
+        "kind": "solid",
+        "bg": "#241235",
+        "on_bg": "#E879F9",
+        "on_bg_muted": "#F5D0FE",
+        "roles": {
+          "border": "#A21CAF",
+          "badge_bg": "#581C87",
+          "label": "Certified Regional IMS"
+        }
+      },
+      {
+        "name": "status_pass",
+        "kind": "solid",
+        "bg": "#064E3B",
+        "on_bg": "#A7F3D0",
+        "on_bg_muted": "#6EE7B7"
+      },
+      {
+        "name": "status_fail",
+        "kind": "solid",
+        "bg": "#450A0A",
+        "on_bg": "#FECACA",
+        "on_bg_muted": "#F87171"
+      },
+      {
+        "name": "status_warn",
+        "kind": "solid",
+        "bg": "#451A03",
+        "on_bg": "#FED7AA",
+        "on_bg_muted": "#FB923C"
+      }
+    ],
+    "accent": "#0284C7",
+    "on_accent": "#FFFFFF",
+    "signals": {
+      "state_vb": "#38BDF8",
+      "state_il": "#34D399",
+      "state_sigma": "#FB923C",
+      "state_vo": "#A78BFA",
+      "residual_esigma": "#F43F5E",
+      "disturbance_marker": "#E11D48",
+      "equilibrium_ref": "#64748B"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "heading": "Manrope Variable, sans-serif",
+      "body": "IBM Plex Sans, sans-serif",
+      "mono": "JetBrains Mono Variable, monospace"
+    },
+    "scale_px": {
+      "display": 36,
+      "h1": 28,
+      "h2": 22,
+      "h3": 18,
+      "h4": 15,
+      "body": 14,
+      "caption": 12
+    },
+    "rules": {
+      "headings": "font-semibold tracking-tight text-slate-100",
+      "body": "font-normal leading-relaxed text-slate-300",
+      "numbers_and_matrices": "font-mono text-xs tracking-tight tabular-nums",
+      "labels_and_badges": "font-mono uppercase text-[11px] tracking-wider font-medium"
+    }
+  },
+  "entry_surfaces": {
+    "/": "Instrument workspace layout with top telemetry/action bar, 3-column analysis grid (Config Left, Analytical Stability Middle, Time-series Charts Right), and bottom claim-verification audit trail."
+  },
+  "layouts": {
+    "container": "w-full max-w-[1720px] mx-auto p-4 md:p-6 space-y-6",
+    "grid_structure": "grid grid-cols-1 xl:grid-cols-12 gap-5",
+    "panels": {
+      "parameters_input": "col-span-1 xl:col-span-3 flex flex-col gap-4",
+      "analytical_equilibrium_stability": "col-span-1 xl:col-span-4 flex flex-col gap-4",
+      "simulation_charts": "col-span-1 xl:col-span-5 flex flex-col gap-4",
+      "audit_claim_legend": "col-span-1 xl:col-span-12"
+    }
+  },
+  "components": {
+    "header_bar": {
+      "path": "@/components/ims/HeaderBar.tsx",
+      "description": "Top telemetry bar showing model name 'Ideal 4-State Stabilizing-MRC [x = (i_L, v_b, sigma, v_o)]', educational tooltips explaining state variables, model validation status badge, active preset selector (e.g. 'Nominal CPL 200W', 'Near-Bifurcation', 'Deep Disturbance', 'Academic Benchmark'), and action buttons: Compute Equilibrium, Run Transient ODE, CSV Export, PDF Report Generator.",
+      "data_testids": [
+        "workflow-header-title",
+        "model-status-badge",
+        "preset-selector",
+        "btn-compute-equilibrium",
+        "btn-run-simulation",
+        "btn-export-csv",
+        "btn-export-pdf"
+      ]
+    },
+    "parameter_entry_form": {
+      "path": "@/components/ims/ParameterEntryForm.tsx",
+      "description": "Precision 2-column tabular input form with inline validation, physical units (H, F, Ohm, V, W), mathematical explanations, and bounds checking. Groups: 1) Circuit Plant (L, C, R, v_in), 2) CPL & Load (P_cpl, R_load), 3) Controller (k_m, k_p, k_i, v_ref), 4) Disturbance & Solver (t_dist_start, t_dist_end, P_cpl_dist, t_final, dt_max, rtol, atol).",
+      "data_testids": [
+        "input-param-L",
+        "input-param-C",
+        "input-param-R",
+        "input-param-vin",
+        "input-param-pcpl",
+        "input-param-km",
+        "input-param-vref",
+        "input-dist-start",
+        "input-dist-pdist",
+        "btn-reset-defaults",
+        "param-validation-error-banner"
+      ]
+    },
+    "equilibrium_panel": {
+      "path": "@/components/ims/EquilibriumPanel.tsx",
+      "description": "Displays analytical closed-form equilibrium vector x* = [i_L*, v_b*, sigma*, v_o*], duty cycle d*, and the numerical closed-loop vector field residual ||f_cl(x*)||_inf with high-precision scientific formatting. Highlights near-zero convergence with explanatory tooltips for students.",
+      "data_testids": [
+        "equilibrium-state-il",
+        "equilibrium-state-vb",
+        "equilibrium-state-sigma",
+        "equilibrium-state-vo",
+        "equilibrium-duty-cycle",
+        "equilibrium-residual-norm",
+        "equilibrium-verification-badge"
+      ]
+    },
+    "stability_analysis_panel": {
+      "path": "@/components/ims/StabilityAnalysisPanel.tsx",
+      "description": "Full local stability analysis breakdown: 1) 4x4 Closed-Loop Jacobian Matrix A_cl, 2) Eigenvalues lambda_1..4, 3) Transverse eigenvalue vs -k_m (showing exact manifold contraction rate), 4) Reduced 3x3 system eigenvalues, 5) Characteristic polynomial coefficients (a3, a2, a1, a0), 6) Routh-Hurwitz 4 conditions table with explicit positive numeric margins.",
+      "data_testids": [
+        "jacobian-matrix-display",
+        "eigenvalues-list",
+        "transverse-eigenvalue-val",
+        "transverse-km-comparison",
+        "reduced-eigenvalues-list",
+        "char-poly-coeffs",
+        "routh-hurwitz-table",
+        "rh-condition-1-margin",
+        "rh-condition-2-margin",
+        "rh-condition-3-margin",
+        "rh-condition-4-margin",
+        "overall-stability-badge"
+      ]
+    },
+    "claim_level_legend": {
+      "path": "@/components/ims/ClaimLevelLegend.tsx",
+      "description": "Crucial distinction component that visually categorizes claims into 4 strict epistemological tiers with distinct badges, borders, and definitions to prevent conflating mathematical proofs with empirical simulations.",
+      "tiers": [
+        {
+          "id": "exact_identity",
+          "color": "#10B981",
+          "title": "Exact Contraction Identity",
+          "definition": "e_Sigma_dot = -k_m * e_Sigma holds algebraically across the entire state space (transverse exponential contraction rate -k_m)."
+        },
+        {
+          "id": "local_stability",
+          "color": "#0284C7",
+          "title": "Local Asymptotic Stability",
+          "definition": "Verified analytically via Jacobian eigenvalues in Re(lambda) < 0 and strictly positive Routh-Hurwitz margins around x*."
+        },
+        {
+          "id": "observed_recovery",
+          "color": "#F59E0B",
+          "title": "Observed Numerical Recovery",
+          "definition": "Trajectory computed via adaptive RK45 / Radau solver under finite-time CPL pulse disturbance returning to epsilon-ball of x*."
+        },
+        {
+          "id": "certified_regional",
+          "color": "#A855F7",
+          "title": "Certified Regional IMS",
+          "definition": "Lyapunov or invariant set boundary certification (requires certified region estimation)."
+        }
+      ],
+      "data_testids": [
+        "claim-tier-exact-identity",
+        "claim-tier-local-stability",
+        "claim-tier-observed-recovery",
+        "claim-tier-certified-regional"
+      ]
+    },
+    "synchronized_charts_panel": {
+      "path": "@/components/ims/SynchronizedChartsPanel.tsx",
+      "description": "Five stacked synchronized time-series charts using Recharts with shared crosshair cursor and brush zoom: 1) Bus Voltage v_b(t), 2) Inductor Current i_L(t), 3) Internal State sigma(t), 4) Output Voltage v_o(t), 5) Manifold Residual |e_Sigma(t)| with logarithmic/symlog toggle. Includes disturbance entry/exit vertical reference spans, equilibrium dashed lines, and tooltip matrix readout.",
+      "data_testids": [
+        "chart-container-vb",
+        "chart-container-il",
+        "chart-container-sigma",
+        "chart-container-vo",
+        "chart-container-esigma",
+        "chart-scale-toggle-log",
+        "chart-disturbance-marker",
+        "chart-crosshair-tooltip",
+        "chart-time-brush"
+      ]
+    },
+    "simulation_status_and_export": {
+      "path": "@/components/ims/SimulationStatusAndExport.tsx",
+      "description": "Summary status cards displaying Solver Status (e.g. 'Converged (RK45, 1420 steps)'), Recovery Outcome ('Recovered to < 0.01% of x* in 14.2ms'), Peak Residual, and direct export actions for CSV time-series and printable LaTeX/PDF verification report.",
+      "data_testids": [
+        "solver-status-card",
+        "recovery-outcome-card",
+        "peak-residual-card",
+        "btn-export-csv-direct",
+        "btn-export-pdf-report"
+      ]
+    }
+  },
+  "motion": {
+    "transitions": "transition-colors duration-150 ease-out",
+    "cards": "hover:border-slate-700 transition-all duration-200",
+    "chart_tooltips": "transition-opacity duration-75 ease-out",
+    "no_universal_transition": true
+  },
+  "accessibility": {
+    "wcag_compliance": "WCAG AA (APCA high-contrast for numbers and charts)",
+    "colorblind_safety": "All claim levels and pass/fail statuses pair color with explicit icon glyphs (CheckCircle2, AlertTriangle, XCircle, ShieldCheck, Sigma, Compass) and clear text badges so state is never conveyed by color alone.",
+    "numeric_readability": "Tabular numerals with monospace styling prevents layout shift during live simulation runs."
+  },
+  "instructions_to_main_agent": [
+    "1. Preserve the existing platform structure: Integrate this page into the existing router (e.g. `/mrc-stabilization` or `/ims/four-state-mrc`) with navigation link in the top/sidebar nav.",
+    "2. Mathematical correctness: Ensure all formulas (closed-form equilibrium x*, Jacobian linearization matrix, Routh-Hurwitz conditions, manifold residual calculation e_Sigma = v_b - v_b_target, ODE simulation) are numerically exact with explicit precision.",
+    "3. Claim Level demarcation: Rigorously apply the 4 distinct claim-level colors (#10B981 Emerald for Exact Identity, #0284C7 Sky for Local Stability, #F59E0B Amber for Observed Recovery, #A855F7 Purple for Certified Regional) to badges, section headers, and tooltips so the user never conflates analytical proof with simulation observation.",
+    "4. Chart synchronization: Use Recharts with `syncId='ims-mrc-sim'` so hovering any chart syncs the vertical cursor across all 5 state plots (v_b, i_L, sigma, v_o, e_Sigma).",
+    "5. Export features: Provide working client/server CSV download with all trajectory columns (t, i_l, v_b, sigma, v_o, e_sigma, p_cpl) and a clean structured PDF/Print report layout.",
+    "6. Include all specified data-testids on buttons, inputs, metrics, badges, and chart containers for automated test verification.",
+    "7. Set dark mode theme tokens in `/app/frontend/src/index.css` using the palette provided in surfaces and signals."
+  ]
+}
