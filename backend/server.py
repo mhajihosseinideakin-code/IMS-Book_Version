@@ -68,6 +68,10 @@ api_router.include_router(four_state_router)
 from routers.analysis import router as analysis_router
 api_router.include_router(analysis_router)
 
+# General MRC Designer routes (mounted on api_router -> /api/mrc_designer/*)
+from routers.mrc_designer import router as mrc_designer_router
+api_router.include_router(mrc_designer_router)
+
 # Include the router in the main app
 app.include_router(api_router)
 

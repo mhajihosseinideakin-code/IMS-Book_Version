@@ -114,6 +114,27 @@ _CASE_DESCRIPTORS: List[AnalysisDescriptor] = [
 _CASE_DESCRIPTOR_INDEX: Dict[str, AnalysisDescriptor] = {d.id: d for d in _CASE_DESCRIPTORS}
 
 
+# --- General MRC Designer (routes to its own workflow, not run via /run) ---
+_DESIGNER_DESCRIPTOR = AnalysisDescriptor(
+    id="mrc_designer",
+    title="General MRC Designer",
+    model_id="stabilizing_mrc",
+    category="controller_synthesis",
+    description="Design a Manifold-Reshaping controller for a supported model: feasibility A(x)=Dphi.G, "
+                "generic closed-form synthesis, closed-loop verification, and open-loop vs MRC Before/After. "
+                "Four-State Stabilising MRC is the validated reference.",
+    supported_outputs=SupportedOutputs(
+        equilibrium=True, manifold_residual=True, residual_trajectory=True,
+        contraction_evidence=True, local_stability=True, finite_horizon_recovery=True,
+        solver_constraint_status=True, report_export=True,
+    ),
+    guarantee_scope="Analytic MRC only where a validated symbolic manifold + control-affine form exist; "
+                    "Before/After is numerical evidence, not a certified regional IMS guarantee.",
+    standardized=False,
+    entry={"type": "embedded_react", "path": "/mrc-designer?embedded=1", "view_fn": "showMrcDesigner"},
+)
+
+
 def get_analysis(analysis_id: str) -> Analysis:
     """Return a runnable Analysis, or raise KeyError if not standardized/known."""
     return ANALYSIS_REGISTRY[analysis_id]
@@ -128,6 +149,7 @@ def list_descriptors() -> List[dict]:
     for analysis in ANALYSIS_REGISTRY.values():
         out.append(analysis.descriptor().to_dict())
     out.extend(d.to_dict() for d in _CASE_DESCRIPTORS)
+    out.append(_DESIGNER_DESCRIPTOR.to_dict())
     return out
 
 

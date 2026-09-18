@@ -133,8 +133,8 @@ header { display: flex; align-items: center; justify-content: space-between; pad
    zone, deliberately kept free of any illustration so it never
    competes with the manifold graphic below it. */
 .hero-header { position: relative; z-index: 2; text-align: center; max-width: 976px; margin: 0 auto; }
-.hero-logo { text-align: left; margin: 0 0 14px; padding-left: 66px; }
-.hero-logo img { height: 172px; width: auto; display: block;
+.hero-logo { text-align: center; margin: 0 auto 12px; padding-left: 0; }
+.hero-logo img { height: 150px; width: auto; display: inline-block;
    -webkit-mask-image: radial-gradient(ellipse 34% 34% at 84% 81%, rgba(0,0,0,0.45) 0%, black 85%);
    mask-image: radial-gradient(ellipse 34% 34% at 84% 81%, rgba(0,0,0,0.45) 0%, black 85%); }
 .hero h1 { font-family: "Inter Tight", var(--sans); font-size: clamp(36px, 3.4vw, 50px); font-weight: 800; margin: 0 0 6px; letter-spacing: -0.6px; line-height: 1.1; color: #FFFFFF; }
@@ -156,6 +156,16 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 .hero-accent-line-fill { height: 100%; width: 40%; background: linear-gradient(90deg, transparent, var(--teal), transparent);
    animation: heroAccentSweep 3.4s ease-in-out infinite; }
 @keyframes heroAccentSweep { 0% { transform: translateX(-120%); } 100% { transform: translateX(340%); } }
+.hero-caps { position: relative; z-index: 2; display: flex; flex-wrap: wrap; align-items: stretch; justify-content: center;
+   gap: 8px; margin: 18px auto 2px; max-width: 940px; }
+.hero-cap { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; background: rgba(255,255,255,0.035);
+   border: 1px solid var(--border-soft); border-radius: 8px; padding: 7px 12px; min-width: 138px; transition: border-color .18s ease, transform .18s ease; }
+.hero-cap:hover { border-color: var(--teal); transform: translateY(-2px); }
+.hero-cap-ic { font-size: 13px; color: var(--teal); line-height: 1; }
+.hero-cap b { font-size: 11.5px; color: var(--text); font-weight: 600; }
+.hero-cap i { font-size: 10px; color: var(--text-muted); font-style: normal; }
+.hero-cap-sep { align-self: center; color: var(--text-muted); font-family: var(--mono); font-size: 12px; opacity: .7; }
+@media (max-width: 760px) { .hero-cap-sep { display: none; } .hero-cap { flex: 1 1 40%; } }
 
 /* Layer 2 -- Scientific visualization: the manifold, trajectory,
    disturbance and equilibrium nodes. Uses xMidYMid *slice* so the
@@ -163,7 +173,7 @@ header { display: flex; align-items: center; justify-content: space-between; pad
    space -- previously the cause of it reading as only ~60% wide),
    then a radial vignette overlay dissolves all four edges into the
    page background so it never reads as an inserted rectangle. */
-.hero-illustration { position: relative; z-index: 1; width: 100%; height: 236px; margin: 4px auto 0; overflow: hidden; }
+.hero-illustration { position: relative; z-index: 1; width: 100%; max-width: 1180px; height: 250px; margin: 6px auto 0; overflow: hidden; }
 .hero-illustration::after { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 2;
    background:
      radial-gradient(ellipse 88% 80% at 50% 48%, transparent 74%, var(--bg) 99%),
@@ -412,6 +422,7 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
     <div class="app-nav-section">Explorer</div>
     <div class="app-nav-item" id="navAnalysisHub" onclick="showAnalysisHub()"><span class="nav-icon">&#9673;</span> Analysis Hub</div>
     <div class="app-nav-item" id="navStabMrc" onclick="showStabilizingMRC()"><span class="nav-icon">&#8721;</span> Stabilising MRC</div>
+    <div class="app-nav-item" id="navMrcDesigner" onclick="showMrcDesigner()"><span class="nav-icon">&#9881;</span> MRC Designer</div>
     <div class="app-nav-section">Library</div>
     <div class="app-nav-item disabled"><span class="nav-icon">&#9679;</span> Recent Analyses <span class="app-nav-soon">Soon</span></div>
     <div class="app-nav-item disabled"><span class="nav-icon">&#9635;</span> Saved Reports <span class="app-nav-soon">Soon</span></div>
@@ -432,6 +443,17 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
             <button class="hero-cta-btn hero-cta-secondary" onclick="openBuilderView()">Create New Project<span class="hero-cta-arrow">&rarr;</span></button>
           </div>
           <div class="hero-accent-line"><div class="hero-accent-line-fill"></div></div>
+          <div class="hero-caps" role="list" aria-label="IMS Platform workflow">
+            <div class="hero-cap" role="listitem"><span class="hero-cap-ic">&#9638;</span><b>Build Networks</b><i>assemble topologies</i></div>
+            <span class="hero-cap-sep">&rarr;</span>
+            <div class="hero-cap" role="listitem"><span class="hero-cap-ic">&#8734;</span><b>Analyse Stability</b><i>equilibria &amp; IMS</i></div>
+            <span class="hero-cap-sep">&rarr;</span>
+            <div class="hero-cap" role="listitem"><span class="hero-cap-ic">&#9881;</span><b>Design Control</b><i>MRC synthesis</i></div>
+            <span class="hero-cap-sep">&rarr;</span>
+            <div class="hero-cap" role="listitem"><span class="hero-cap-ic">&#8767;</span><b>Simulate &amp; Validate</b><i>closed-loop runs</i></div>
+            <span class="hero-cap-sep">&rarr;</span>
+            <div class="hero-cap" role="listitem"><span class="hero-cap-ic">&#9636;</span><b>Generate Reports</b><i>CSV &amp; PDF</i></div>
+          </div>
         </div>
         <div class="hero-illustration">
 <svg class="hero-bg-scene" viewBox="0 0 1400 700" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" preserveAspectRatio="xMidYMin slice">
@@ -763,6 +785,9 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
       <iframe id="stabMrcFrame" title="Stabilising MRC Analysis" style="width:100%; height:100%; border:0; display:block; background:#0B0E14;"></iframe>
     </div>
     <div id="analysisHubView" style="display:none; padding: 32px; max-width: 1180px; margin: 0 auto;"></div>
+    <div id="mrcDesignerView" style="display:none; height: calc(100vh - 128px);">
+      <iframe id="mrcDesignerFrame" title="General MRC Designer" style="width:100%; height:100%; border:0; display:block; background:#0B0E14;"></iframe>
+    </div>
   </div>
 </div>
 
@@ -1294,7 +1319,7 @@ function setAppNavActive(label) {
    chrome (header, sidebar, breadcrumb); the analysis renders inside. */
 function showStabilizingMRC() {
   ["pmView", "wsView", "builderView", "caseLibraryView", "iberianView",
-   "gfmCaseView", "multiConverterCaseView", "analysisHubView"].forEach(function (id) {
+   "gfmCaseView", "multiConverterCaseView", "analysisHubView", "mrcDesignerView"].forEach(function (id) {
     var e = $(id); if (e) e.style.display = "none";
   });
   $("stabMrcView").style.display = "block";
@@ -1307,6 +1332,23 @@ function showStabilizingMRC() {
   if (f && !f.getAttribute("src")) f.setAttribute("src", "/mrc?embedded=1");
 }
 
+/* General MRC Designer: Network Builder -> Model Assembly -> IMS Analysis ->
+   Design MRC -> Closed-Loop Verification -> Before/After. */
+function showMrcDesigner() {
+  ["pmView", "wsView", "builderView", "caseLibraryView", "iberianView",
+   "gfmCaseView", "multiConverterCaseView", "analysisHubView", "stabMrcView"].forEach(function (id) {
+    var e = $(id); if (e) e.style.display = "none";
+  });
+  $("mrcDesignerView").style.display = "block";
+  $("appShell").style.display = "flex";
+  $("appFooter").style.display = "flex";
+  $("crumbBar").innerHTML = '<b onclick="showProjectManager()">Project Manager</b> &rsaquo; Explorer &rsaquo; MRC Designer';
+  document.querySelectorAll(".app-nav-item").forEach(function (el) { el.classList.remove("active"); });
+  var n = $("navMrcDesigner"); if (n) n.classList.add("active");
+  var f = $("mrcDesignerFrame");
+  if (f && !f.getAttribute("src")) f.setAttribute("src", "/mrc-designer?embedded=1");
+}
+
 /* Ensure the MRC analysis view is hidden whenever any other view is shown.
    Wraps the existing global navigation functions without editing each one. */
 (function () {
@@ -1316,7 +1358,7 @@ function showStabilizingMRC() {
     var orig = window[name];
     if (typeof orig === "function") {
       window[name] = function () {
-        ["stabMrcView", "analysisHubView"].forEach(function (id) {
+        ["stabMrcView", "analysisHubView", "mrcDesignerView"].forEach(function (id) {
           var v = document.getElementById(id);
           if (v) v.style.display = "none";
         });

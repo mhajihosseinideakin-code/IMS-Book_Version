@@ -58,6 +58,15 @@ P=20kW, v_nom=400V, R=0.2Ω, L=1.5mH, C=2.5mF, R_v=0.5Ω, K_i=50/s, k_m=500/s
 ## Auth
 None. No login/PIN gating.
 
+## General MRC Designer (Network Builder → … → Before/After)
+- `backend/ims_platform/mrc_designer/`: `feasibility.py` (hybrid control-affine split f(x)/G(x) — analytic via symbolic engine, else finite-difference diagnostic; analytic Dφ; `A(x)=Dφ·G` report: dims, rank, condition number, relative degree, singular flag, `mrc_established` gate), `designer.py` (generic synthesis via `MRCSynthesizer` — reproduces the exact four-state law; closed-loop verify delegates to the verified stabilizing workflow; open-loop-vs-MRC `before_after` on identical conditions). Never auto-synthesizes/invents a manifold for unsupported models; never promotes numeric evidence to analytic/certified claims.
+- Router `/api/mrc_designer/*`: models, default_params, feasibility, synthesize, verify, before_after (reuses four_state run cache for CSV/PDF).
+- Registered in the Analysis Hub (`mrc_designer` descriptor). Frontend: React `src/pages/MrcDesigner.tsx` at `/mrc-designer`, embedded natively via explorer.html `showMrcDesigner()` ("Explorer → MRC Designer" nav). First supported scope = models with a validated symbolic manifold + control-affine form (four-state reference; converter_cpl diagnostic); assembled networks get an explicit "MRC not established" reason.
+- Reference regression: the generic path reproduces the four-state equilibrium (‖f_cl(x*)‖=0), λ⊥=−k_m, residual contraction, and poles within tolerance.
+
+## Home hero (explorer.html)
+Logo centered in the content area (text-align:center), tightened vertical hierarchy, headline "Trace stability. Quantify recoverability." preserved, dark/gradient identity preserved. Added a compact capability strip (Build Networks → Analyse Stability → Design Control → Simulate & Validate → Generate Reports) between CTAs and the widened Disturbance→Equilibrium visualization. Visual-only; no backend/nav changes.
+
 ## Claim levels (kept strictly distinct, never conflated)
 ideal residual contraction (exact) | local equilibrium stability (linearisation) |
 observed finite-horizon recovery (empirical) | certified regional IMS (NOT established this milestone).

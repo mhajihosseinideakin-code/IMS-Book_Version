@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Routes, Route } from "react-router-dom";
 import FourState from "@/pages/FourState";
+import MrcDesigner from "@/pages/MrcDesigner";
 
 // The existing IMS Platform (Flask explorer.html, served by the backend) is the
 // primary application. The public root redirects into it. The verified
@@ -18,6 +19,7 @@ export default function App() {
     <Routes>
       <Route path="/" element={<PlatformRedirect />} />
       <Route path="/mrc" element={<FourState />} />
+      <Route path="/mrc-designer" element={<MrcDesigner />} />
     </Routes>
   );
 }
