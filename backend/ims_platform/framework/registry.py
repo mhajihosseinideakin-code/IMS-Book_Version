@@ -149,7 +149,6 @@ def list_descriptors() -> List[dict]:
     for analysis in ANALYSIS_REGISTRY.values():
         out.append(analysis.descriptor().to_dict())
     out.extend(d.to_dict() for d in _CASE_DESCRIPTORS)
-    out.append(_DESIGNER_DESCRIPTOR.to_dict())
     return out
 
 

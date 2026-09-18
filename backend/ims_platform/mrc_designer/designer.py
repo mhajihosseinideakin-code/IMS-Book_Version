@@ -21,7 +21,13 @@ from ..core.system import DynamicalSystem
 from ..core.simulator import Simulator
 from ..control.mrc_synthesis import MRCSynthesizer, MRCSynthesisError
 from ..models.stabilizing_mrc import StabilizingMRCModel
+from ..models.converter_cpl_paper import ConverterCPLPaper
 from .feasibility import feasibility_report, _has_symbolic
+
+#: Nominal DC bus voltage used to anchor the converter-CPL equilibrium family
+#: (the outer-loop state v_o is free at u=0, so the equilibrium is a 1-parameter
+#: family; the assembled Network + Auto-MRC demo anchors it at the nominal bus).
+_CPL_V_NOM = 400.0
 
 
 class MRCNotEstablished(Exception):
@@ -32,6 +38,18 @@ class MRCNotEstablished(Exception):
 # adding a converter/network-specific MRC formulation = add an entry here.
 def _stabilizing_factory(params: Dict) -> DynamicalSystem:
     return StabilizingMRCModel(params=params)
+
+
+def _converter_cpl_factory(params: Dict) -> DynamicalSystem:
+    return ConverterCPLPaper(params=params)
+
+
+def _converter_cpl_equilibrium(p: Dict) -> np.ndarray:
+    # Anchored at the nominal bus V: di_l=0 -> v_o = R i_l + v_b; dv_b=0 ->
+    # i_l = P/v_b; dv_o = u = 0. (i_l, v_b, v_o) order of ConverterCPLPaper.
+    V = _CPL_V_NOM
+    i_l = float(p["P"]) / V
+    return np.array([i_l, V, V + float(p["R"]) * i_l])
 
 
 _DESIGNER_MODELS: Dict[str, Dict] = {
@@ -45,6 +63,28 @@ _DESIGNER_MODELS: Dict[str, Dict] = {
             "validated_controlled_invariant": True,
         },
         "reference_workflow": "ims_platform.stabilizing.workflow",
+    },
+    # The assembled Network + Auto-MRC demo: its MRC law is derived by the
+    # Symbolic Engine from ConverterCPLPaper (paper eq. 1-6/13). Registered here
+    # so a project's downstream "Design MRC Controller" stage synthesizes on the
+    # SAME validated model the project's IMS analysis used -- no substitution of
+    # the four-state reference.
+    "converter_cpl_paper": {
+        "factory": _converter_cpl_factory,
+        "control_symbol": "u",
+        "title": "Assembled Converter-CPL Network (Auto-MRC)",
+        "manifold_roles": {
+            "ims_analysis_manifold": "e_m(x) = v_b - (v_o - R i_l)  (paper eq. 6, on the assembled network)",
+            "candidate_mrc_target": "same e_m(x): analytic controlled-invariant target derived by the Symbolic Engine",
+            "validated_controlled_invariant": True,
+        },
+        "equilibrium": _converter_cpl_equilibrium,
+        "full_stability_note": (
+            "This assembled reconstruction has a documented, structurally-positive tangential mode "
+            "(P/(C v_b^2), independent of parameters; see tests/test_mrc_synthesis.py). MRC guarantees "
+            "the manifold residual's exponential contraction at rate k_m (transverse mode = -k_m), NOT "
+            "full local asymptotic stability of this specific 3-state fixture."
+        ),
     },
 }
 
@@ -100,11 +140,32 @@ def synthesize_mrc(model_id: str, params: Dict, k_m: Optional[float] = None) -> 
 
 
 def _equilibrium(system: DynamicalSystem, params: Dict, model_id: str) -> np.ndarray:
+    spec = _DESIGNER_MODELS.get(model_id, {})
+    if callable(spec.get("equilibrium")):
+        return np.asarray(spec["equilibrium"](params), dtype=float)
     if hasattr(system, "equilibrium_closed_form"):
         return np.asarray(system.equilibrium_closed_form(params), dtype=float)
     eq = system.find_equilibrium(system.initial_guess() if hasattr(system, "initial_guess")
                                  else np.zeros(system.n_states), with_eigs=False)
     return eq.x_star
+
+
+def feasibility_for(model_id: str, params: Dict) -> Dict:
+    """
+    Feasibility report for a registered designer model at its equilibrium.
+    Raises MRCNotEstablished if the model is not registered (so the API layer
+    can report an explicit, honest 'not established' instead of a hard 404).
+    """
+    if model_id not in _DESIGNER_MODELS:
+        raise MRCNotEstablished(
+            f"MRC not established: model '{model_id}' has no validated analytic manifold / "
+            f"control-affine (f, G) formulation registered with the Designer. Analytic MRC synthesis "
+            f"requires a symbolic manifold phi(x) and a control-affine split; only diagnostic feasibility "
+            f"would be possible for this assembled model. Supported: {get_designer_model_ids()}."
+        )
+    system = _DESIGNER_MODELS[model_id]["factory"](params)
+    x_star = _equilibrium(system, params, model_id)
+    return feasibility_report(system, x_star, params)
 
 
 def _run(system: DynamicalSystem, params: Dict, x0: np.ndarray, controller: Callable,
@@ -162,7 +223,71 @@ def verify_closed_loop(model_id: str, params: Dict, sim_cfg: Dict, k_m: Optional
             "solver_status": ds["provenance"]["solver"],
             "run_id": ds["run_id"], "provenance": ds["provenance"],
         }
-    raise MRCNotEstablished(f"closed-loop verification not wired for '{model_id}'")
+    # ---- generic path (e.g. assembled converter_cpl_paper network) ----------
+    spec = _DESIGNER_MODELS[model_id]
+    system = spec["factory"](params)
+    x_star = _equilibrium(system, params, model_id)
+    km_val = float(design["k_m"])
+    law = design["_numeric_law"]
+    p = params
+    n = system.n_states
+
+    def _cl_field(x: np.ndarray) -> np.ndarray:
+        u = np.array([law(x)])
+        return np.asarray(system.dynamics(0.0, x, u, p), dtype=float)
+
+    # closed-loop equilibrium residual (numerically verified, not just the formula)
+    res_norm = float(np.linalg.norm(_cl_field(x_star)))
+
+    # closed-loop Jacobian via finite difference (route independent of synthesis)
+    J = np.zeros((n, n)); h = 1e-6; f0 = _cl_field(x_star)
+    for j in range(n):
+        xp = x_star.astype(float).copy(); xp[j] += h
+        J[:, j] = (_cl_field(xp) - f0) / h
+    eigs = np.linalg.eigvals(J)
+    idx = int(np.argmin(np.abs(eigs - (-km_val))))
+    lam_perp = eigs[idx]
+    transverse_ok = bool(abs(lam_perp.real + km_val) < max(1e-3 * km_val, 1.0) and abs(lam_perp.imag) < 1.0)
+    locally_stable = bool(np.all(eigs.real < 0))
+
+    # residual contraction from a deliberately off-manifold initial condition
+    pert = sim_cfg.get("initial_perturbation") or {}
+    delta = np.array([float(pert.get(nm, 0.0)) for nm in system.state_names])
+    x0 = x_star + delta
+    run = _run(system, params, x0, lambda t, x: np.array([law(x)]), sim_cfg)
+    t = run["t"]; X = run["X"]
+    resid_fn = getattr(system, "residual_e_sigma", None) or getattr(system, "manifold_residual_numeric", None)
+    e = np.array([float(resid_fn(X[:, k], params)) for k in range(X.shape[1])])
+    e0 = float(e[0])
+    e_theory = e0 * np.exp(-km_val * np.asarray(t))
+    denom = max(abs(e0), 1e-12)
+    max_rel = float(np.max(np.abs(e - e_theory)) / denom)
+
+    scope_note = spec.get("full_stability_note", "") or (
+        "Local linear stability is a linearisation claim, distinct from a certified regional IMS guarantee.")
+    return {
+        "design": _serializable_design(design),
+        "equilibrium": {"x_star": {system.state_names[i]: float(x_star[i]) for i in range(n)},
+                        "residual_norm": res_norm, "claim_level": "local_equilibrium_stability"},
+        "local_stability": {
+            "full_eigenvalues": [{"re": float(z.real), "im": float(z.imag)} for z in eigs],
+            "transverse_eigenvalue": {"re": float(lam_perp.real), "im": float(lam_perp.imag)},
+            "transverse_expected": -km_val, "transverse_check_ok": transverse_ok,
+            "routh_hurwitz": [], "locally_exponentially_stable": locally_stable,
+            "scope_note": scope_note, "claim_level": "local_equilibrium_stability"},
+        "residual_trajectory": {"t": [float(v) for v in t], "e_sigma": [float(v) for v in e],
+                                "e_sigma_theory": [float(v) for v in e_theory]},
+        "contraction_evidence": {"identity": "d e_m/dt = -k_m e_m",
+                                 "max_rel_error": max_rel, "claim_level": "ideal_residual_contraction"},
+        "trajectories": {"t": [float(v) for v in t],
+                         "states": {system.state_names[i]: [float(v) for v in X[i]] for i in range(n)},
+                         "events": [{"t": float(a), "label": b} for (a, b) in run["events"]],
+                         "x_star": {system.state_names[i]: float(x_star[i]) for i in range(n)}},
+        "recovery_status": {"recovery_outcome": ("observed_recovery" if run["success"] and abs(e[-1]) < denom else "observed_no_recovery"),
+                            "solver_success": run["success"], "claim_level": "observed_finite_horizon_recovery"},
+        "solver_status": {"method": sim_cfg.get("method", "RK45"), "success": run["success"], "message": run["message"]},
+        "run_id": None,
+    }
 
 
 def before_after(model_id: str, params: Dict, sim_cfg: Dict, k_m: Optional[float] = None) -> Dict:
@@ -186,8 +311,9 @@ def before_after(model_id: str, params: Dict, sim_cfg: Dict, k_m: Optional[float
         t = run["t"]; X = run["X"]
         names = list(system.state_names)
         e_sigma = None
-        if hasattr(system, "residual_e_sigma"):
-            e_sigma = [float(system.residual_e_sigma(X[:, k], params)) for k in range(X.shape[1])]
+        resid_fn = getattr(system, "residual_e_sigma", None) or getattr(system, "manifold_residual_numeric", None)
+        if resid_fn is not None:
+            e_sigma = [float(resid_fn(X[:, k], params)) for k in range(X.shape[1])]
         return {
             "t": [float(v) for v in t],
             "states": {names[i]: [float(v) for v in X[i]] for i in range(len(names))},

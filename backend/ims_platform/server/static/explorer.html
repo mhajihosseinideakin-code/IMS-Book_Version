@@ -133,10 +133,8 @@ header { display: flex; align-items: center; justify-content: space-between; pad
    zone, deliberately kept free of any illustration so it never
    competes with the manifold graphic below it. */
 .hero-header { position: relative; z-index: 2; text-align: center; max-width: 976px; margin: 0 auto; }
-.hero-logo { text-align: center; margin: 0 auto 12px; padding-left: 0; }
-.hero-logo img { height: 150px; width: auto; display: inline-block;
-   -webkit-mask-image: radial-gradient(ellipse 34% 34% at 84% 81%, rgba(0,0,0,0.45) 0%, black 85%);
-   mask-image: radial-gradient(ellipse 34% 34% at 84% 81%, rgba(0,0,0,0.45) 0%, black 85%); }
+.hero-logo { text-align: center; margin: 0 auto 4px; padding-left: 0; }
+.hero-logo img { height: clamp(132px, 13.5vw, 196px); width: auto; display: inline-block; }
 .hero h1 { font-family: "Inter Tight", var(--sans); font-size: clamp(36px, 3.4vw, 50px); font-weight: 800; margin: 0 0 6px; letter-spacing: -0.6px; line-height: 1.1; color: #FFFFFF; }
 .hero-h1-quantify { background: linear-gradient(90deg, #9B6EFA, #4F8FFF); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .hero-h1-accent { color: #7FFFC4; }
@@ -156,15 +154,18 @@ header { display: flex; align-items: center; justify-content: space-between; pad
 .hero-accent-line-fill { height: 100%; width: 40%; background: linear-gradient(90deg, transparent, var(--teal), transparent);
    animation: heroAccentSweep 3.4s ease-in-out infinite; }
 @keyframes heroAccentSweep { 0% { transform: translateX(-120%); } 100% { transform: translateX(340%); } }
-.hero-caps { position: relative; z-index: 2; display: flex; flex-wrap: wrap; align-items: stretch; justify-content: center;
-   gap: 8px; margin: 18px auto 2px; max-width: 940px; }
-.hero-cap { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; background: rgba(255,255,255,0.035);
-   border: 1px solid var(--border-soft); border-radius: 8px; padding: 7px 12px; min-width: 138px; transition: border-color .18s ease, transform .18s ease; }
-.hero-cap:hover { border-color: var(--teal); transform: translateY(-2px); }
-.hero-cap-ic { font-size: 13px; color: var(--teal); line-height: 1; }
-.hero-cap b { font-size: 11.5px; color: var(--text); font-weight: 600; }
-.hero-cap i { font-size: 10px; color: var(--text-muted); font-style: normal; }
-.hero-cap-sep { align-self: center; color: var(--text-muted); font-family: var(--mono); font-size: 12px; opacity: .7; }
+.hero-caps { position: relative; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+   gap: 0; margin: 16px auto 2px; max-width: 900px; }
+.hero-cap { position: relative; display: flex; flex-direction: column; align-items: center; gap: 5px; text-align: center;
+   padding: 6px 14px; min-width: 124px; border-radius: 9px; transition: background .18s ease, transform .18s ease; }
+.hero-cap:hover { background: rgba(63,224,168,0.05); transform: translateY(-2px); }
+.hero-cap-ic { width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+   font-size: 13px; color: var(--teal); background: rgba(63,224,168,0.08); border: 1px solid rgba(63,224,168,0.34);
+   transition: background .18s ease, box-shadow .18s ease; }
+.hero-cap:hover .hero-cap-ic { background: rgba(63,224,168,0.17); box-shadow: 0 0 16px rgba(63,224,168,0.5); }
+.hero-cap b { font-size: 11px; color: var(--text); font-weight: 600; letter-spacing: .01em; }
+.hero-cap i { font-size: 9.5px; color: var(--text-muted); font-style: normal; }
+.hero-cap-sep { align-self: flex-start; margin-top: 14px; color: rgba(127,255,196,0.42); font-family: var(--mono); font-size: 14px; }
 @media (max-width: 760px) { .hero-cap-sep { display: none; } .hero-cap { flex: 1 1 40%; } }
 
 /* Layer 2 -- Scientific visualization: the manifold, trajectory,
@@ -173,12 +174,11 @@ header { display: flex; align-items: center; justify-content: space-between; pad
    space -- previously the cause of it reading as only ~60% wide),
    then a radial vignette overlay dissolves all four edges into the
    page background so it never reads as an inserted rectangle. */
-.hero-illustration { position: relative; z-index: 1; width: 100%; max-width: 1180px; height: 250px; margin: 6px auto 0; overflow: hidden; }
+.hero-illustration { position: relative; z-index: 1; width: 100%; max-width: 1240px; height: clamp(240px, 26vw, 322px); margin: 2px auto 0; overflow: hidden;
+   -webkit-mask-image: radial-gradient(ellipse 84% 82% at 50% 45%, #000 50%, transparent 93%);
+   mask-image: radial-gradient(ellipse 84% 82% at 50% 45%, #000 50%, transparent 93%); }
 .hero-illustration::after { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 2;
-   background:
-     radial-gradient(ellipse 88% 80% at 50% 48%, transparent 74%, var(--bg) 99%),
-     linear-gradient(to right, var(--bg) 0%, transparent 1%, transparent 99%, var(--bg) 100%),
-     linear-gradient(to bottom, var(--bg) 0%, transparent 35%, transparent 55%, var(--bg) 100%); }
+   background: linear-gradient(to bottom, transparent 60%, var(--bg) 100%); }
 .hero-bg-scene { position: absolute; inset: 0; width: 100%; height: 100%; transform-origin: 56% 18%;
    opacity: 0; animation: heroTrajFadeIn 0.75s ease-out 0.15s forwards; }
 @keyframes heroTrajFadeIn {
@@ -422,7 +422,6 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
     <div class="app-nav-section">Explorer</div>
     <div class="app-nav-item" id="navAnalysisHub" onclick="showAnalysisHub()"><span class="nav-icon">&#9673;</span> Analysis Hub</div>
     <div class="app-nav-item" id="navStabMrc" onclick="showStabilizingMRC()"><span class="nav-icon">&#8721;</span> Stabilising MRC</div>
-    <div class="app-nav-item" id="navMrcDesigner" onclick="showMrcDesigner()"><span class="nav-icon">&#9881;</span> MRC Designer</div>
     <div class="app-nav-section">Library</div>
     <div class="app-nav-item disabled"><span class="nav-icon">&#9679;</span> Recent Analyses <span class="app-nav-soon">Soon</span></div>
     <div class="app-nav-item disabled"><span class="nav-icon">&#9635;</span> Saved Reports <span class="app-nav-soon">Soon</span></div>
@@ -700,12 +699,6 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
   </circle>
 </svg>
         </div>
-        <div class="hero-features">
-          <div class="hero-feature"><div class="hero-feature-icon" style="background:var(--teal-dim);color:var(--teal);">&#128200;</div><div><b>Intrinsic Manifold</b><span>Geometry-based analysis</span></div></div>
-          <div class="hero-feature"><div class="hero-feature-icon" style="background:var(--blue-dim);color:var(--blue);">&#128737;</div><div><b>Recoverability</b><span>Quantify margins and regions</span></div></div>
-          <div class="hero-feature"><div class="hero-feature-icon" style="background:var(--amber-dim);color:var(--amber);">&#128421;</div><div><b>Validated Engine</b><span>Real backend, not a simulation</span></div></div>
-          <div class="hero-feature"><div class="hero-feature-icon" style="background:var(--purple-dim);color:var(--purple);">&#128202;</div><div><b>Reliable Results</b><span>Tested, verified, and trusted</span></div></div>
-        </div>
       </div>
       <div class="qa-row">
         <div class="qa-panel">
@@ -785,9 +778,6 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
       <iframe id="stabMrcFrame" title="Stabilising MRC Analysis" style="width:100%; height:100%; border:0; display:block; background:#0B0E14;"></iframe>
     </div>
     <div id="analysisHubView" style="display:none; padding: 32px; max-width: 1180px; margin: 0 auto;"></div>
-    <div id="mrcDesignerView" style="display:none; height: calc(100vh - 128px);">
-      <iframe id="mrcDesignerFrame" title="General MRC Designer" style="width:100%; height:100%; border:0; display:block; background:#0B0E14;"></iframe>
-    </div>
   </div>
 </div>
 
@@ -1332,22 +1322,11 @@ function showStabilizingMRC() {
   if (f && !f.getAttribute("src")) f.setAttribute("src", "/mrc?embedded=1");
 }
 
-/* General MRC Designer: Network Builder -> Model Assembly -> IMS Analysis ->
-   Design MRC -> Closed-Loop Verification -> Before/After. */
-function showMrcDesigner() {
-  ["pmView", "wsView", "builderView", "caseLibraryView", "iberianView",
-   "gfmCaseView", "multiConverterCaseView", "analysisHubView", "stabMrcView"].forEach(function (id) {
-    var e = $(id); if (e) e.style.display = "none";
-  });
-  $("mrcDesignerView").style.display = "block";
-  $("appShell").style.display = "flex";
-  $("appFooter").style.display = "flex";
-  $("crumbBar").innerHTML = '<b onclick="showProjectManager()">Project Manager</b> &rsaquo; Explorer &rsaquo; MRC Designer';
-  document.querySelectorAll(".app-nav-item").forEach(function (el) { el.classList.remove("active"); });
-  var n = $("navMrcDesigner"); if (n) n.classList.add("active");
-  var f = $("mrcDesignerFrame");
-  if (f && !f.getAttribute("src")) f.setAttribute("src", "/mrc-designer?embedded=1");
-}
+/* The General MRC Designer is no longer a standalone Explorer workflow. It now
+   lives inside every project workspace as the downstream "Design MRC Controller"
+   stage (after IMS Analysis), inheriting the project's assembled model, params,
+   equilibrium and IMS results as the single source of truth. See
+   renderDesignMrcStage / runDesignMrc below. */
 
 /* Ensure the MRC analysis view is hidden whenever any other view is shown.
    Wraps the existing global navigation functions without editing each one. */
@@ -2961,6 +2940,7 @@ var STAGES = [
   { key: "equilibrium", label: "Solve Equilibrium" },
   { key: "simulate", label: "Run Simulation" },
   { key: "ims_analysis", label: "IMS Analysis" },
+  { key: "design_mrc", label: "Design MRC Controller" },
   { key: "report", label: "Generate Report" },
 ];
 
@@ -3007,6 +2987,8 @@ function renderMain() {
   var err = document.createElement("div");
   err.id = "wsError"; err.className = "error-box no-print"; err.style.display = "none";
   el.appendChild(err);
+
+  if (activeStage === "design_mrc") { renderDesignMrcStage(el); return; }
 
   var formPanel = document.createElement("div");
   formPanel.className = "panel no-print";
@@ -3370,6 +3352,255 @@ async function runStage(stage) {
 function nextStageAfter(stage) {
   var idx = STAGES.findIndex(function (s) { return s.key === stage; });
   return STAGES[Math.min(idx + 1, STAGES.length - 1)].key;
+}
+
+/* ===================== DESIGN MRC CONTROLLER (in-project downstream stage) =====================
+   The General MRC Designer, integrated as a project stage. It inherits the
+   current project's assembled model, parameters, k_m, equilibrium and IMS
+   results (the single source of truth) and runs feasibility -> synthesis ->
+   closed-loop verification -> before/after on THAT model. Honest per-model:
+   the analytic synthesis path is established only where a validated symbolic
+   manifold + control-affine (f, G) form exist. */
+
+function designerModelForProject(p) {
+  if (!p) return null;
+  if (p.category === "network_mrc") return "converter_cpl_paper";
+  return null;  // no registered analytic Designer model for this assembled model
+}
+
+function designerParamsForProject() {
+  var fp = formState.params || {};
+  return { R: fp.R, L: fp.L, C: fp.C, P: fp.P };
+}
+
+function feasStatus(f) {
+  if (f && f.mrc_established && f.establishment_basis === "analytic") return "supported";
+  if (f && !f.mrc_established && (f.establishment_basis === "numeric_only" || f.establishment_basis === "insufficient_authority")) return "diagnostic";
+  return "not_established";
+}
+
+function buildDesignerSim(model_id, params, km) {
+  var dv = formState.disturbance_value || [-5, 0, 0];
+  var horizon = formState.horizon || 0.02;
+  var pert = {};
+  if (model_id === "converter_cpl_paper") {
+    // network_mrc disturbance order [v_bus, i_L, v_o] -> converter_cpl (i_l, v_b, v_o)
+    pert = { v_b: dv[0] || 0, i_l: dv[1] || 0, v_o: dv[2] || 0 };
+  }
+  return { model_id: model_id, params: params, k_m: km, t_end: horizon, n_eval: 800,
+           initial_perturbation: pert, disturbance: null };
+}
+
+async function postJson(url, body) {
+  var resp = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  var data = await resp.json();
+  if (!resp.ok) throw new Error((data && (data.detail || data.error)) || ("HTTP " + resp.status));
+  return data;
+}
+
+async function runDesignMrc() {
+  var p = currentProject;
+  var model_id = designerModelForProject(p);
+  if (!model_id) return;
+  var btn = $("designMrcRunBtn"); if (btn) { btn.disabled = true; btn.textContent = "Designing MRC controller\u2026"; }
+  var box = $("wsError"); if (box) box.style.display = "none";
+  try {
+    var params = designerParamsForProject();
+    var km = (typeof formState.km === "number" && isFinite(formState.km)) ? formState.km : 500;
+    var feas = await postJson("/api/mrc_designer/feasibility", { model_id: model_id, params: params });
+    var result = { model_id: model_id, params: params, km: km, feasibility: feas, status: feasStatus(feas) };
+    if (result.status === "supported") {
+      var simReq = buildDesignerSim(model_id, params, km);
+      result.synthesis = await postJson("/api/mrc_designer/synthesize", { model_id: model_id, params: params, k_m: km });
+      result.verify = await postJson("/api/mrc_designer/verify", simReq);
+      result.before_after = await postJson("/api/mrc_designer/before_after", simReq);
+    }
+    stageResults.design_mrc = result;
+    renderWorkspace();
+  } catch (err) {
+    var box2 = $("wsError"); if (box2) { box2.style.display = "block"; box2.textContent = "Design MRC failed: " + (err && err.message ? err.message : String(err)); }
+    console.error(err);
+  } finally {
+    var b = $("designMrcRunBtn"); if (b) { b.disabled = false; b.textContent = "Run: Design MRC Controller"; }
+  }
+}
+
+function dmCplx(z) {
+  if (!z) return "\u2014";
+  if (Math.abs(z.im) < 1e-9) return (+z.re).toPrecision(5);
+  return (+z.re).toPrecision(5) + (z.im >= 0 ? " + " : " \u2212 ") + Math.abs(z.im).toPrecision(5) + "j";
+}
+function dmNum(v, p) {
+  if (v === null || v === undefined || !isFinite(v)) return "\u2014";
+  p = p || 4; var a = Math.abs(v);
+  if (v !== 0 && (a < 1e-3 || a >= 1e5)) return v.toExponential(p - 1);
+  return String(+v.toPrecision(p));
+}
+
+function dmStatusBadge(status) {
+  if (status === "supported") return "<div style='display:inline-block;font-size:11px;font-weight:700;color:#3FE0A8;border:1px solid #3FE0A8;border-radius:4px;padding:3px 10px;'>MRC SYNTHESIS SUPPORTED</div>";
+  if (status === "diagnostic") return "<div style='display:inline-block;font-size:11px;font-weight:700;color:#6FC6FF;border:1px solid #6FC6FF;border-radius:4px;padding:3px 10px;'>DIAGNOSTIC / FEASIBILITY ONLY</div>";
+  return "<div style='display:inline-block;font-size:11px;font-weight:700;color:#FFB454;border:1px solid #FFB454;border-radius:4px;padding:3px 10px;'>MRC SYNTHESIS NOT ESTABLISHED</div>";
+}
+
+function renderDesignMrcStage(el) {
+  var p = currentProject;
+  var model_id = designerModelForProject(p);
+  var eq = stageResults.equilibrium, ims = stageResults.ims_analysis;
+
+  var ctxPanel = document.createElement("div"); ctxPanel.className = "panel";
+  var ch = "<div class='panel-title'>Inherited from this project (single source of truth)</div>" +
+    "<div class='help-text' style='margin-bottom:8px;'>The MRC design stage does not recreate the model. It consumes the assembled model, parameters, equilibrium and IMS results produced by the earlier stages of <b>" + (p.label || "this project") + "</b>.</div><div class='info-grid'>";
+  var fp = formState.params || {};
+  ["R", "L", "C", "P"].forEach(function (k) { if (fp[k] !== undefined) ch += "<div class='info-card'><div class='lbl'>" + k + "</div><div class='val'>" + dmNum(fp[k]) + "</div></div>"; });
+  if (typeof formState.km === "number") ch += "<div class='info-card'><div class='lbl'>k_m</div><div class='val'>" + dmNum(formState.km) + "</div></div>";
+  ch += "</div>";
+  if (eq && eq.x_star) ch += "<div class='panel-title' style='margin-top:12px;'>Project equilibrium x*</div><div class='eq-readout' style='font-size:12px;'>[" + eq.x_star.map(function (v) { return dmNum(v); }).join(", ") + "]</div>";
+  if (ims && ims.residual_statistics) {
+    var rs = ims.residual_statistics;
+    ch += "<div class='panel-title' style='margin-top:12px;'>IMS analysis \u2014 manifold residual</div><div class='eq-readout' style='font-size:12px;'>max |e_m| = " + dmNum(rs.max) + " &middot; final = " + dmNum(rs.final) + " &middot; empirical contraction rate \u2248 " + dmNum(rs.empirical_contraction_rate) + " s\u207B\u00B9</div>";
+  }
+  ctxPanel.innerHTML = ch; el.appendChild(ctxPanel);
+
+  if (!model_id) {
+    var np = document.createElement("div"); np.className = "panel";
+    np.innerHTML = "<div class='panel-title'>MRC Feasibility</div><div style='margin-bottom:8px;'>" + dmStatusBadge("not_established") + "</div>" +
+      "<div class='help-text'>This project's assembled model has no validated analytic controlled-target manifold \u03C6(x) registered with the MRC Designer. Analytic MRC synthesis requires a symbolic manifold \u03C6(x) and a control-affine split x\u0307 = f(x) + G(x)u; without it only a numeric distance-to-manifold residual exists, which cannot on its own establish an MRC. The validated synthesis paths are the <b>Network + Auto-MRC</b> project (assembled Converter\u2013CPL model) and the <b>Stabilising MRC</b> benchmark.</div>";
+    el.appendChild(np);
+    appendDesignMrcClaims(el); appendContinueToReport(el); return;
+  }
+
+  var runPanel = document.createElement("div"); runPanel.className = "panel no-print";
+  runPanel.innerHTML = "<div class='panel-title'>Design MRC Controller</div><div class='help-text'>Runs analytic feasibility A(x)=D\u03C6\u00B7G on the assembled model, then generic closed-form synthesis, closed-loop verification, and an open-loop vs MRC Before/After on identical conditions.</div>";
+  var runBtn = document.createElement("button"); runBtn.className = "run-stage"; runBtn.id = "designMrcRunBtn";
+  runBtn.textContent = "Run: Design MRC Controller"; runBtn.onclick = runDesignMrc;
+  runPanel.appendChild(runBtn); el.appendChild(runPanel);
+
+  var r = stageResults.design_mrc;
+  if (r) renderDesignMrcResults(el, r);
+  else { var ph = document.createElement("p"); ph.className = "placeholder-msg"; ph.textContent = "Run this stage to design and verify the MRC controller."; el.appendChild(ph); }
+}
+
+function renderDesignMrcResults(el, r) {
+  var f = r.feasibility || {};
+  var fpnl = document.createElement("div"); fpnl.className = "panel";
+  var h = "<div class='panel-title'>MRC Feasibility \u2014 A(x) = D\u03C6(x)\u00B7G(x)</div><div style='margin-bottom:10px;'>" + dmStatusBadge(r.status) + "</div><div class='info-grid'>" +
+    "<div class='info-card'><div class='lbl'>dim \u03C6</div><div class='val'>" + (f.dim_phi != null ? f.dim_phi : "\u2014") + "</div></div>" +
+    "<div class='info-card'><div class='lbl'>dim u</div><div class='val'>" + (f.dim_u != null ? f.dim_u : "\u2014") + "</div></div>" +
+    "<div class='info-card'><div class='lbl'>rank A</div><div class='val'>" + (f.rank_A != null ? f.rank_A : "\u2014") + "</div></div>" +
+    "<div class='info-card'><div class='lbl'>cond(A)</div><div class='val'>" + dmNum(f.condition_number) + "</div></div></div>";
+  if (f.A) h += "<div class='panel-title' style='margin-top:12px;'>A(x)</div><div class='eq-readout' style='font-size:12px;'>[" + f.A.map(function (row) { return row.map(function (v) { return dmNum(v); }).join(", "); }).join("; ") + "]</div>";
+  h += "<div class='help-text' style='margin-top:8px;'>G(x): <b>" + (f.G_method || "\u2014") + "</b> &middot; \u03C6(x): <b>" + (f.manifold_method || "\u2014") + "</b> &middot; basis: <b>" + (f.establishment_basis || "\u2014") + "</b></div><div class='help-text' style='margin-top:6px;'>" + (f.reason || "") + "</div>";
+  fpnl.innerHTML = h; el.appendChild(fpnl);
+
+  if (r.status !== "supported") { appendDesignMrcClaims(el); appendContinueToReport(el); return; }
+
+  var syn = r.synthesis || {};
+  var sp = document.createElement("div"); sp.className = "panel";
+  var sh = "<div class='panel-title'>Synthesized control law &nbsp; u = \u03BA(x)</div><div class='help-text'>generic relation: " + (syn.synthesis_relation || "") + "</div><div class='law-box' style='font-size:12.5px;word-break:break-word;'>" + (syn.control_law_symbolic || "") + "</div>";
+  if (syn.manifold_roles) {
+    var mr = syn.manifold_roles;
+    sh += "<div class='help-text' style='margin-top:8px;'>IMS-analysis manifold: <span style='font-family:monospace;'>" + mr.ims_analysis_manifold + "</span><br>Candidate MRC target: <span style='font-family:monospace;'>" + mr.candidate_mrc_target + "</span><br>Validated controlled-invariant: <b>" + mr.validated_controlled_invariant + "</b></div>";
+  }
+  sp.innerHTML = sh; el.appendChild(sp);
+
+  var v = r.verify || {}; var ls = v.local_stability || {}; var ce = v.contraction_evidence || {}; var eqv = v.equilibrium || {};
+  var vp = document.createElement("div"); vp.className = "panel";
+  var vh = "<div class='panel-title'>Closed-loop verification</div><div class='info-grid'>" +
+    "<div class='info-card'><div class='lbl'>\u2016f_cl(x*)\u2016</div><div class='val'>" + dmNum(eqv.residual_norm, 3) + "</div></div>" +
+    "<div class='info-card'><div class='lbl'>\u03BB\u22A5 vs \u2212k_m</div><div class='val'>" + dmCplx(ls.transverse_eigenvalue) + (ls.transverse_check_ok ? " \u2713" : " \u2717") + "</div></div>" +
+    "<div class='info-card'><div class='lbl'>residual rel-err</div><div class='val'>" + dmNum(ce.max_rel_error, 3) + "</div></div></div>";
+  if (ls.full_eigenvalues) vh += "<div class='help-text' style='margin-top:8px;'>closed-loop poles: " + ls.full_eigenvalues.map(dmCplx).join(", ") + "</div>";
+  vh += "<div style='margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;'>" +
+    "<span style='font-size:10.5px;border:1px solid #10B981;color:#10B981;border-radius:4px;padding:2px 7px;'>exact residual contraction: " + (ce.identity || "") + "</span>" +
+    "<span style='font-size:10.5px;border-radius:4px;padding:2px 7px;border:1px solid " + (ls.locally_exponentially_stable ? "#3FE0A8;color:#3FE0A8" : "#FFB454;color:#FFB454") + ";'>local stability: " + (ls.locally_exponentially_stable ? "stable" : "NOT guaranteed") + "</span></div>";
+  if (ls.scope_note) vh += "<div class='help-text' style='margin-top:8px;'>" + ls.scope_note + "</div>";
+  vp.innerHTML = vh; el.appendChild(vp);
+
+  var ba = r.before_after;
+  if (ba) {
+    var bp = document.createElement("div"); bp.className = "panel";
+    bp.innerHTML = "<div class='panel-title'>Before / After \u2014 open-loop vs MRC (identical scenario)</div><div class='help-text'>Manifold residual e_m(t) is what MRC reshapes: open-loop it is uncontrolled; under MRC it contracts exponentially at rate k_m.</div><div id='designMrcResidChart'></div><div id='designMrcVbChart' style='margin-top:14px;'></div>";
+    el.appendChild(bp);
+    var mp = document.createElement("div"); mp.className = "panel";
+    var m = ba.metrics || {};
+    var mh = "<div class='panel-title'>Comparison metrics</div><div class='eq-readout' style='font-size:12px;'>";
+    if (m.final_state_deviation) mh += "final \u2016x\u2212x*\u2016 &mdash; open-loop: " + dmNum(m.final_state_deviation.open_loop) + " &middot; MRC: " + dmNum(m.final_state_deviation.mrc) + "</div>";
+    else mh += "</div>";
+    mh += "<div class='help-text' style='margin-top:6px;'>" + (ba.disclaimer || "") + "</div>";
+    mp.innerHTML = mh;
+    var csvBtn = document.createElement("button"); csvBtn.className = "secondary-btn no-print"; csvBtn.textContent = "Export CSV (before/after)";
+    csvBtn.onclick = function () { exportDesignMrcCsv(r); };
+    mp.appendChild(csvBtn); el.appendChild(mp);
+    setTimeout(function () { drawDesignMrcCharts(ba); }, 0);
+  }
+
+  appendDesignMrcClaims(el); appendContinueToReport(el);
+}
+
+function drawDesignMrcCharts(ba) {
+  var ol = ba.open_loop, mc = ba.mrc; if (!ol || !mc) return;
+  var t = ol.t;
+  var residEl = $("designMrcResidChart");
+  if (residEl && ol.e_sigma && mc.e_sigma) {
+    var w = 640, h = 240, m = { l: 64, r: 14, t: 16, b: 46 };
+    var olPts = t.map(function (tv, i) { return [tv * 1000, ol.e_sigma[i]]; });
+    var mcPts = t.map(function (tv, i) { return [tv * 1000, mc.e_sigma[i]]; });
+    var bounds = computeBounds([olPts, mcPts], 0.1);
+    residEl.innerHTML = "<div style='font-family:var(--display);font-weight:700;font-size:12px;margin:8px 0 6px;'>Manifold residual e_m (V)</div><canvas id='dmResidCanvas' width='" + w + "' height='" + h + "' style='width:100%;max-width:" + w + "px;background:var(--panel-alt);border-radius:6px;'></canvas>" + chartLegendHtml([{ color: "#FF6B6B", label: "open-loop (u=0)" }, { color: "#3FE0A8", label: "MRC" }]);
+    var ctx = $("dmResidCanvas").getContext("2d");
+    drawGrid(ctx, bounds, w, h, m, "time (ms)", "e_m (V)", { tickFontSize: 13 });
+    drawLine(ctx, [[bounds.xmin, 0], [bounds.xmax, 0]], bounds, w, h, m, "#556", 1, [4, 3]);
+    drawLine(ctx, olPts, bounds, w, h, m, "#FF6B6B", 2);
+    drawLine(ctx, mcPts, bounds, w, h, m, "#3FE0A8", 2.2);
+  }
+  var vbEl = $("designMrcVbChart");
+  if (vbEl && ol.states && ol.states.v_b && mc.states && mc.states.v_b) {
+    var w2 = 640, h2 = 240, m2 = { l: 64, r: 14, t: 16, b: 46 };
+    var olV = t.map(function (tv, i) { return [tv * 1000, ol.states.v_b[i]]; });
+    var mcV = t.map(function (tv, i) { return [tv * 1000, mc.states.v_b[i]]; });
+    var vbStar = ba.x_star && ba.x_star.v_b;
+    var bounds2 = computeBounds([olV, mcV], 0.1);
+    vbEl.innerHTML = "<div style='font-family:var(--display);font-weight:700;font-size:12px;margin:8px 0 6px;'>Bus voltage v_b (V)</div><canvas id='dmVbCanvas' width='" + w2 + "' height='" + h2 + "' style='width:100%;max-width:" + w2 + "px;background:var(--panel-alt);border-radius:6px;'></canvas>" + chartLegendHtml([{ color: "#FF6B6B", label: "open-loop" }, { color: "#3FE0A8", label: "MRC" }, { color: "#FFB454", label: "v_b*", dashed: true }]);
+    var ctx2 = $("dmVbCanvas").getContext("2d");
+    drawGrid(ctx2, bounds2, w2, h2, m2, "time (ms)", "v_b (V)", { tickFontSize: 13 });
+    if (vbStar != null) drawLine(ctx2, [[bounds2.xmin, vbStar], [bounds2.xmax, vbStar]], bounds2, w2, h2, m2, "#FFB454", 1.2, [5, 4]);
+    drawLine(ctx2, olV, bounds2, w2, h2, m2, "#FF6B6B", 2);
+    drawLine(ctx2, mcV, bounds2, w2, h2, m2, "#3FE0A8", 2.2);
+  }
+}
+
+function exportDesignMrcCsv(r) {
+  var ba = r.before_after; if (!ba) return;
+  var ol = ba.open_loop, mc = ba.mrc, t = ol.t;
+  var rows = ["t_s,e_m_open_loop,e_m_mrc,v_b_open_loop,v_b_mrc"];
+  for (var i = 0; i < t.length; i++) {
+    rows.push([t[i],
+      ol.e_sigma ? ol.e_sigma[i] : "", mc.e_sigma ? mc.e_sigma[i] : "",
+      (ol.states && ol.states.v_b) ? ol.states.v_b[i] : "", (mc.states && mc.states.v_b) ? mc.states.v_b[i] : ""].join(","));
+  }
+  var blob = new Blob([rows.join("\n")], { type: "text/csv" });
+  var a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = "mrc_before_after_" + (r.model_id || "model") + ".csv"; a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+}
+
+function appendDesignMrcClaims(el) {
+  var c = document.createElement("div"); c.className = "panel";
+  c.innerHTML = "<div class='panel-title'>Guarantee classification (kept strictly distinct)</div><div class='help-text' style='line-height:1.7;'>" +
+    "<b>Ideal residual contraction</b> \u2014 exact (\u0117_m = \u2212k_m e_m) for the ideal unsaturated model.<br>" +
+    "<b>Local equilibrium stability</b> \u2014 a linearisation claim about the equilibrium.<br>" +
+    "<b>Observed finite-horizon recovery</b> \u2014 empirical, from one simulated scenario.<br>" +
+    "<b>Certified regional IMS</b> \u2014 a stronger claim, NOT established by any of the above.</div>";
+  el.appendChild(c);
+}
+
+function appendContinueToReport(el) {
+  var cp = document.createElement("div"); cp.className = "panel no-print";
+  cp.style.cssText = "text-align:center;background:var(--teal-dim);border-color:var(--teal);";
+  var b = document.createElement("button"); b.className = "run-stage"; b.style.maxWidth = "320px"; b.style.margin = "0 auto";
+  b.textContent = "\u2713 Continue to Generate Report \u2192"; b.onclick = function () { goToStage("report"); };
+  cp.appendChild(b); el.appendChild(cp);
 }
 
 /* ===================== RESULTS RENDERING PER STAGE ===================== */

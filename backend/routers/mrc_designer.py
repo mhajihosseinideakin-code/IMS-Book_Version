@@ -23,7 +23,9 @@ if str(_BACKEND_DIR) not in sys.path:
 from ims_platform.mrc_designer import (  # noqa: E402
     feasibility_report, synthesize_mrc, verify_closed_loop, before_after, MRCNotEstablished,
 )
-from ims_platform.mrc_designer.designer import get_designer_model_ids, _DESIGNER_MODELS  # noqa: E402
+from ims_platform.mrc_designer.designer import (  # noqa: E402
+    get_designer_model_ids, _DESIGNER_MODELS, feasibility_for,
+)
 from ims_platform.models.stabilizing_mrc import StabilizingMRCModel  # noqa: E402
 from routers.four_state import _cache as _four_state_cache  # noqa: E402
 
@@ -72,12 +74,13 @@ def default_params(model_id: str):
 
 @router.post("/feasibility")
 def feasibility(req: DesignRequest):
-    if req.model_id not in _DESIGNER_MODELS:
-        raise HTTPException(status_code=404, detail=f"unsupported model '{req.model_id}'")
-    system = _DESIGNER_MODELS[req.model_id]["factory"](req.params)
-    x_star = system.equilibrium_closed_form(req.params) if hasattr(system, "equilibrium_closed_form") \
-        else system.find_equilibrium(system.initial_guess(), with_eigs=False).x_star
-    return feasibility_report(system, x_star, req.params)
+    # Honest per-model feasibility: unregistered/assembled models return an
+    # explicit "MRC not established" with the mathematical reason, not a 404.
+    try:
+        return feasibility_for(req.model_id, req.params)
+    except MRCNotEstablished as e:
+        return {"mrc_established": False, "establishment_basis": "none",
+                "dim_u": None, "G_method": "n/a", "manifold_method": "n/a", "reason": str(e)}
 
 
 @router.post("/synthesize")

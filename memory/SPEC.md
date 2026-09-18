@@ -58,14 +58,44 @@ P=20kW, v_nom=400V, R=0.2Ω, L=1.5mH, C=2.5mF, R_v=0.5Ω, K_i=50/s, k_m=500/s
 ## Auth
 None. No login/PIN gating.
 
-## General MRC Designer (Network Builder → … → Before/After)
-- `backend/ims_platform/mrc_designer/`: `feasibility.py` (hybrid control-affine split f(x)/G(x) — analytic via symbolic engine, else finite-difference diagnostic; analytic Dφ; `A(x)=Dφ·G` report: dims, rank, condition number, relative degree, singular flag, `mrc_established` gate), `designer.py` (generic synthesis via `MRCSynthesizer` — reproduces the exact four-state law; closed-loop verify delegates to the verified stabilizing workflow; open-loop-vs-MRC `before_after` on identical conditions). Never auto-synthesizes/invents a manifold for unsupported models; never promotes numeric evidence to analytic/certified claims.
-- Router `/api/mrc_designer/*`: models, default_params, feasibility, synthesize, verify, before_after (reuses four_state run cache for CSV/PDF).
-- Registered in the Analysis Hub (`mrc_designer` descriptor). Frontend: React `src/pages/MrcDesigner.tsx` at `/mrc-designer`, embedded natively via explorer.html `showMrcDesigner()` ("Explorer → MRC Designer" nav). First supported scope = models with a validated symbolic manifold + control-affine form (four-state reference; converter_cpl diagnostic); assembled networks get an explicit "MRC not established" reason.
-- Reference regression: the generic path reproduces the four-state equilibrium (‖f_cl(x*)‖=0), λ⊥=−k_m, residual contraction, and poles within tolerance.
+## General MRC Designer (now a downstream stage INSIDE the project workspace)
+- **No longer a standalone Explorer item.** The MRC Designer is the project workspace's downstream
+  stage `design_mrc` ("Design MRC Controller"), inserted in STAGES between `ims_analysis` and `report`
+  (explorer.html). It inherits the project's assembled model, params, k_m, equilibrium and IMS results
+  (single source of truth) via `renderDesignMrcStage`/`runDesignMrc` — it never recreates the model or
+  substitutes the four-state reference. The standalone `navMrcDesigner` sidebar item, `mrcDesignerView`
+  iframe, `showMrcDesigner()` and the Analysis-Hub `mrc_designer` descriptor were removed. "Analysis Hub"
+  and the "Stabilising MRC" benchmark sidebar items are kept.
+- **Three honest feasibility outcomes** (per model, math reason always given): MRC Synthesis Supported
+  (analytic G + analytic φ, A=Dφ·G full-row-rank & well-conditioned), Diagnostic/Feasibility Only
+  (numeric-only), MRC Synthesis Not Established (no validated analytic controlled-target manifold).
+  `feasStatus()` maps `establishment_basis` (analytic|numeric_only|insufficient_authority|none).
+- **Supported project = "Network + Auto-MRC Demo" (network_auto_mrc, category network_mrc).** Its MRC is
+  derived by the Symbolic Engine from `ConverterCPLPaper` (paper eq. 1-6/13). Backend: `converter_cpl_paper`
+  registered in `_DESIGNER_MODELS` (mrc_designer/designer.py) with an anchored equilibrium
+  (i_l=P/V, v_b=V=400, v_o=V+R·i_l) and a generic `verify_closed_loop` branch (finite-diff closed-loop
+  Jacobian; λ⊥ found nearest −k_m; off-manifold residual contraction vs e_m(0)e^(−k_m t)). Verified: λ⊥=−k_m,
+  residual rel-err ~1.5e-8, ‖f_cl(x*)‖~3e-11. HONEST: full local stability is NOT guaranteed for this
+  fixture (documented structurally-positive tangential mode P/(C v_b²)); MRC guarantees residual (transverse)
+  contraction only — shown with a scope note. Before/After plots the manifold residual e_m open-loop vs MRC
+  (the meaningful comparison) + bus voltage; CSV export is client-side. All other projects → honest
+  "Not Established" with the mathematical reason.
+- Router `/api/mrc_designer/*`: feasibility (returns honest not-established, not 404, for unregistered
+  models via `feasibility_for`), synthesize, verify, before_after. Registered analytic models:
+  `stabilizing_mrc` (reference), `converter_cpl_paper` (assembled network).
+- Reference regression unchanged: the generic path still reproduces the four-state equilibrium, λ⊥=−k_m,
+  residual contraction and poles within tolerance.
 
-## Home hero (explorer.html)
-Logo centered in the content area (text-align:center), tightened vertical hierarchy, headline "Trace stability. Quantify recoverability." preserved, dark/gradient identity preserved. Added a compact capability strip (Build Networks → Analyse Stability → Design Control → Simulate & Validate → Generate Reports) between CTAs and the widened Disturbance→Equilibrium visualization. Visual-only; no backend/nav changes.
+## Home hero (explorer.html) — refined premium scientific landing
+Logo enlarged (clamp 132-196px, full wordmark, no corner mask) and centered in the content area (after the
+sidebar). Cleaner hierarchy: logo → "Trace stability. Quantify recoverability." → short description → CTAs
+(Open Example Project | Create New Project) → compact connected workflow pipeline. The four bottom feature
+cards (Intrinsic Manifold / Recoverability / Validated Engine / Reliable Results) were removed. Workflow strip
+(`.hero-caps`) is a connected pipeline: 5 circular-icon nodes (Build Networks → Analyse Stability → Design
+Control → Simulate & Validate → Generate Reports) joined by arrow separators, with hover states, subordinate to
+the headline. The Disturbance→Equilibrium manifold SVG (`.hero-illustration`) is integrated via a radial
+`mask-image` feathering all edges (no rectangular boundary) + a bottom fade to bg; larger height; the existing
+scientific trajectory/markers are preserved. Dark identity preserved. Visual-only; no backend/nav changes.
 
 ## Claim levels (kept strictly distinct, never conflated)
 ideal residual contraction (exact) | local equilibrium stability (linearisation) |
