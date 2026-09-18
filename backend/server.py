@@ -82,8 +82,14 @@ try:
     from starlette.middleware.wsgi import WSGIMiddleware
     from ims_platform.server.app import create_app as _create_flask_app
     _flask_app = _create_flask_app()
-    app.mount("/legacy", WSGIMiddleware(_flask_app))
-    logging.getLogger(__name__).info("Legacy Flask IMS Platform mounted at /legacy")
+    # Mount the existing IMS Platform (Flask) as the PRIMARY application at root.
+    # This is a catch-all mounted LAST, so the FastAPI routes registered above
+    # (/api/four_state/*, /api/status, /api/, /docs) take precedence; every other
+    # path (/, /assets/*, /api/health, /api/projects, /api/case_library,
+    # /api/iberian/*, /api/gfm_current_limit/*, /api/multi_converter_fault/*,
+    # /api/report/*, /api/auth/*) is served by the existing platform unchanged.
+    app.mount("/", WSGIMiddleware(_flask_app))
+    logging.getLogger(__name__).info("IMS Platform (Flask) mounted at / (primary app)")
 except Exception as _e:  # pragma: no cover - legacy app is optional at runtime
     logging.getLogger(__name__).warning("Legacy Flask app not mounted: %s", _e)
 

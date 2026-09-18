@@ -6,14 +6,23 @@ x = (i_ℓ, v_b, σ, v_o), domain D = {v_b > 0}. Built on the vendored, pre-exis
 Python core (`backend/ims_platform/`, formerly a Flask app), now exposed through FastAPI + a React
 workspace. The legacy Flask platform is preserved and mounted at `/legacy` (WSGIMiddleware).
 
-## Architecture
-- **Frontend** (React 19, Vite, port 3000): single workspace page `src/pages/FourState.tsx` at route `/`.
-  Types + API calls in `src/lib/ims.ts`. Dark engineering theme in `src/index.css`.
-- **Backend** (FastAPI, port 8001): router `backend/routers/four_state.py` under `/api/four_state/*`.
-  Math core untouched in `backend/ims_platform/` (verified `models/stabilizing_mrc.py`).
-  New workflow layer `backend/ims_platform/stabilizing/` (model, workflow, report) — thin orchestration,
-  no re-derivation of the reference maths.
-- **Legacy Flask app**: mounted at `/api`-independent path `/legacy` (e.g. `/legacy/api/health`).
+## Architecture (platform-integrated)
+- **Primary app = the existing IMS Platform** (Flask `ims_platform/server/app.py` + `static/explorer.html`):
+  hero, Projects, New Project, Case Library (5 cases), Workspace, Docs, auth. It is mounted in FastAPI
+  at root `/` via WSGIMiddleware (catch-all, last) and is the public-URL experience. Its ~60 `/api/*`
+  routes are served unchanged.
+- **FastAPI (port 8001)** owns only `/api/four_state/*` (router `backend/routers/four_state.py`),
+  `/api/status`, `/api/`, `/docs`; everything else falls through to the Flask platform.
+- **Vite (port 3000, public)** proxies `/api`, `/assets`, and `/explorer.html`→Flask `/` to 8001.
+  React root `/` redirects to `/explorer.html` (the platform). React route `/mrc` is the verified MRC
+  analysis workspace (`src/pages/FourState.tsx`), rendered header-slim when `?embedded=1`.
+- **MRC integrated natively**: explorer.html has an "Explorer → Stabilising MRC" sidebar item
+  (`showStabilizingMRC()`, `#stabMrcView`) that embeds `/mrc?embedded=1` in an iframe inside the
+  platform chrome (breadcrumb Project Manager › Explorer › Stabilising MRC). A monkey-patch hides the
+  MRC view when navigating to any other view.
+- **Math core** untouched in `backend/ims_platform/` (verified `models/stabilizing_mrc.py`); the MRC
+  workflow layer `backend/ims_platform/stabilizing/` (model, workflow, report) is thin orchestration,
+  no re-derivation. Electrical-constraint diagnostic model preserved (`models/converter_cpl_paper.py`).
 
 ## Data model / equations (Appendix A of the reference)
 - Plant: L·di_ℓ=v_o−R·i_ℓ−v_b ; C·dv_b=i_ℓ−P/v_b ; dσ=v_nom−v_b ; dv_o=u

@@ -142,6 +142,7 @@ function ResidualPlot({ dataset, logScale }: { dataset: SimDataset; logScale: bo
 }
 
 export default function FourState() {
+  const embedded = new URLSearchParams(window.location.search).get("embedded") === "1";
   const [params, setParams] = useState<FourStateParams>({ ...NOMINAL_PARAMS });
   const [tEnd, setTEnd] = useState(0.06);
   const [pert, setPert] = useState<Perturbation>({ i_l: 0, v_b: 0, sigma: 0, v_o: 20 });
@@ -187,11 +188,11 @@ export default function FourState() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <Toaster richColors position="bottom-right" />
-      {/* Header */}
+      {/* Header — slim in embedded mode (branding hidden; the platform supplies chrome) */}
       <header className="border-b border-border bg-card/60 backdrop-blur sticky top-0 z-20">
         <div className="max-w-[1720px] mx-auto px-4 md:px-6 py-3 flex flex-wrap items-center gap-3">
           <Waves className="text-primary" size={22} />
-          <div className="flex-1 min-w-[240px]">
+          <div className={`flex-1 min-w-[240px] ${embedded ? "hidden" : ""}`}>
             <h1 data-testid="workflow-header-title" className="text-lg font-semibold tracking-tight leading-none">
               IMS Platform · Ideal Four-State Stabilizing MRC
             </h1>

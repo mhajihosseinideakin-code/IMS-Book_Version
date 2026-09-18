@@ -106,9 +106,16 @@ export default defineConfig(async () => {
           target: "http://localhost:8001",
           changeOrigin: true,
         },
-        // Preserved legacy Flask IMS Platform (explorer.html + ~60 routes),
-        // mounted in FastAPI at /legacy via WSGIMiddleware.
-        "/legacy": {
+        // The existing IMS Platform (Flask explorer.html) is the primary app,
+        // mounted in FastAPI at / and reached through the backend. Serve its
+        // entry document and static assets through the dev-server proxy so the
+        // platform is the public-URL experience.
+        "/explorer.html": {
+          target: "http://localhost:8001",
+          changeOrigin: true,
+          rewrite: () => "/",
+        },
+        "/assets": {
           target: "http://localhost:8001",
           changeOrigin: true,
         },

@@ -409,6 +409,8 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
     <div class="app-nav-item" onclick="openBuilderView()"><span class="nav-icon">+</span> New Project</div>
     <div class="app-nav-section">Case Library</div>
     <div class="app-nav-item" id="navIberian" onclick="showCaseLibrary()"><span class="nav-icon">&#9889;</span> Case Library</div>
+    <div class="app-nav-section">Explorer</div>
+    <div class="app-nav-item" id="navStabMrc" onclick="showStabilizingMRC()"><span class="nav-icon">&#8721;</span> Stabilising MRC</div>
     <div class="app-nav-section">Library</div>
     <div class="app-nav-item disabled"><span class="nav-icon">&#9679;</span> Recent Analyses <span class="app-nav-soon">Soon</span></div>
     <div class="app-nav-item disabled"><span class="nav-icon">&#9635;</span> Saved Reports <span class="app-nav-soon">Soon</span></div>
@@ -756,6 +758,9 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
     <div id="iberianView" style="display:none; padding: 32px; max-width: 1180px; margin: 0 auto;"></div>
     <div id="gfmCaseView" style="display:none; padding: 32px; max-width: 1180px; margin: 0 auto;"></div>
     <div id="multiConverterCaseView" style="display:none; padding: 32px; max-width: 1180px; margin: 0 auto;"></div>
+    <div id="stabMrcView" style="display:none; height: calc(100vh - 128px);">
+      <iframe id="stabMrcFrame" title="Stabilising MRC Analysis" style="width:100%; height:100%; border:0; display:block; background:#0B0E14;"></iframe>
+    </div>
   </div>
 </div>
 
@@ -1205,6 +1210,42 @@ function setAppNavActive(label) {
     el.classList.toggle("active", el.textContent.trim().indexOf(label) === 0);
   });
 }
+
+/* ===================== STABILISING MRC (verified four-state analysis) ===================== */
+/* Native Explorer analysis surface. Reuses the verified /api/four_state/* backend
+   through an embedded React workspace at /mrc. The IMS Platform supplies the
+   chrome (header, sidebar, breadcrumb); the analysis renders inside. */
+function showStabilizingMRC() {
+  ["pmView", "wsView", "builderView", "caseLibraryView", "iberianView",
+   "gfmCaseView", "multiConverterCaseView"].forEach(function (id) {
+    var e = $(id); if (e) e.style.display = "none";
+  });
+  $("stabMrcView").style.display = "block";
+  $("appShell").style.display = "flex";
+  $("appFooter").style.display = "flex";
+  $("crumbBar").innerHTML = '<b onclick="showProjectManager()">Project Manager</b> &rsaquo; Explorer &rsaquo; Stabilising MRC';
+  document.querySelectorAll(".app-nav-item").forEach(function (el) { el.classList.remove("active"); });
+  var n = $("navStabMrc"); if (n) n.classList.add("active");
+  var f = $("stabMrcFrame");
+  if (f && !f.getAttribute("src")) f.setAttribute("src", "/mrc?embedded=1");
+}
+
+/* Ensure the MRC analysis view is hidden whenever any other view is shown.
+   Wraps the existing global navigation functions without editing each one. */
+(function () {
+  var navFns = ["showProjectManager", "openBuilderView", "showCaseLibrary",
+    "showIberianScenario", "showGfmCurrentLimitCase", "showMultiConverterCase", "openProject"];
+  navFns.forEach(function (name) {
+    var orig = window[name];
+    if (typeof orig === "function") {
+      window[name] = function () {
+        var v = document.getElementById("stabMrcView");
+        if (v) v.style.display = "none";
+        return orig.apply(this, arguments);
+      };
+    }
+  });
+})();
 
 function showProjectManager() {
   $("pmView").style.display = "block";
