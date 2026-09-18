@@ -410,6 +410,7 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
     <div class="app-nav-section">Case Library</div>
     <div class="app-nav-item" id="navIberian" onclick="showCaseLibrary()"><span class="nav-icon">&#9889;</span> Case Library</div>
     <div class="app-nav-section">Explorer</div>
+    <div class="app-nav-item" id="navAnalysisHub" onclick="showAnalysisHub()"><span class="nav-icon">&#9673;</span> Analysis Hub</div>
     <div class="app-nav-item" id="navStabMrc" onclick="showStabilizingMRC()"><span class="nav-icon">&#8721;</span> Stabilising MRC</div>
     <div class="app-nav-section">Library</div>
     <div class="app-nav-item disabled"><span class="nav-icon">&#9679;</span> Recent Analyses <span class="app-nav-soon">Soon</span></div>
@@ -761,6 +762,7 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
     <div id="stabMrcView" style="display:none; height: calc(100vh - 128px);">
       <iframe id="stabMrcFrame" title="Stabilising MRC Analysis" style="width:100%; height:100%; border:0; display:block; background:#0B0E14;"></iframe>
     </div>
+    <div id="analysisHubView" style="display:none; padding: 32px; max-width: 1180px; margin: 0 auto;"></div>
   </div>
 </div>
 
@@ -1205,6 +1207,81 @@ function renderProjectGrid() {
   });
 }
 
+/* ===================== EXPLORER ANALYSIS HUB (shared framework) ===================== */
+/* Common hub: lists every analysis registered in the shared framework
+   (/api/analysis/registry) and routes to each through the standard workflow.
+   Runnable analyses (e.g. Stabilising MRC) open their analysis surface;
+   connected validated cases open their existing, unchanged views. */
+function showAnalysisHub() {
+  ["pmView", "wsView", "builderView", "caseLibraryView", "iberianView",
+   "gfmCaseView", "multiConverterCaseView", "stabMrcView"].forEach(function (id) {
+    var e = $(id); if (e) e.style.display = "none";
+  });
+  var v = $("analysisHubView"); v.style.display = "block";
+  $("appShell").style.display = "flex";
+  $("appFooter").style.display = "flex";
+  $("crumbBar").innerHTML = '<b onclick="showProjectManager()">Project Manager</b> &rsaquo; Explorer &rsaquo; Analysis Hub';
+  document.querySelectorAll(".app-nav-item").forEach(function (el) { el.classList.remove("active"); });
+  var n = $("navAnalysisHub"); if (n) n.classList.add("active");
+  v.innerHTML = '<div style="color:#8aa;">Loading analyses...</div>';
+  fetch("/api/analysis/registry").then(function (r) { return r.json(); }).then(function (data) {
+    renderAnalysisHub(data);
+  }).catch(function (e) {
+    v.innerHTML = '<div style="color:#f88;">Failed to load analysis registry: ' + e + '</div>';
+  });
+}
+
+function renderAnalysisHub(data) {
+  var v = $("analysisHubView");
+  var OUT = [
+    ["equilibrium", "Equilibrium"], ["manifold_residual", "Manifold residual"],
+    ["residual_trajectory", "Residual trajectory"], ["contraction_evidence", "Contraction"],
+    ["local_stability", "Local stability"], ["finite_horizon_recovery", "Recovery"],
+    ["solver_constraint_status", "Solver/constraint"], ["report_export", "Report/export"]
+  ];
+  var stages = (data.workflow_stages || []).join('  &rsaquo;  ');
+  var html = '<div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#5fd6b0;">Explorer</div>'
+    + '<h1 style="font-size:30px;margin:6px 0 4px 0;">Analysis Hub</h1>'
+    + '<p style="color:#9fb0c0;max-width:760px;">One shared engine for every validated IMS study. '
+    + 'Standard workflow: <span style="color:#cdd;">' + stages + '</span></p>'
+    + '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px;margin-top:18px;">';
+  (data.analyses || []).forEach(function (a) {
+    var badges = OUT.filter(function (o) { return a.supported_outputs && a.supported_outputs[o[0]]; })
+      .map(function (o) {
+        return '<span style="font-size:10px;border:1px solid #2b6;color:#7de;border-radius:4px;padding:1px 6px;margin:0 4px 4px 0;display:inline-block;">' + o[1] + '</span>';
+      }).join('');
+    var runnable = a.standardized;
+    var tag = runnable
+      ? '<span style="font-size:10px;color:#0a0f16;background:#5fd6b0;border-radius:4px;padding:2px 7px;font-weight:700;">RUNNABLE</span>'
+      : '<span style="font-size:10px;color:#0a0f16;background:#e6b34d;border-radius:4px;padding:2px 7px;font-weight:700;">VALIDATED CASE</span>';
+    html += '<div class="analysis-card" style="border:1px solid #22303f;border-radius:10px;padding:16px;background:#0f1622;cursor:pointer;"'
+      + ' onclick="openAnalysis(' + escapeJsAttr(JSON.stringify(a)) + ')">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">'
+      + '<span style="font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#7f93a6;">' + (a.category || '') + '</span>' + tag + '</div>'
+      + '<h3 style="margin:8px 0 6px 0;font-size:17px;">' + a.title + '</h3>'
+      + '<p style="color:#93a4b5;font-size:13px;min-height:56px;">' + (a.description || '') + '</p>'
+      + '<div style="margin-top:8px;">' + badges + '</div>'
+      + '<div style="margin-top:10px;font-size:11px;color:#6f8296;">' + (a.guarantee_scope || '') + '</div>'
+      + '</div>';
+  });
+  html += '</div>';
+  v.innerHTML = html;
+}
+
+function escapeJsAttr(s) { return s.replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;'); }
+
+function openAnalysis(a) {
+  if (typeof a === "string") { try { a = JSON.parse(a); } catch (e) { return; } }
+  var entry = a.entry || {};
+  var fn = entry.view_fn;
+  if (fn === "openProject" && entry.project_id && typeof window.openProject === "function") {
+    return window.openProject(entry.project_id);
+  }
+  if (fn && typeof window[fn] === "function") { return window[fn](); }
+  // Fallback: unknown routing -> Case Library.
+  if (typeof window.showCaseLibrary === "function") return window.showCaseLibrary();
+}
+
 function setAppNavActive(label) {
   document.querySelectorAll(".app-nav-item").forEach(function (el) {
     el.classList.toggle("active", el.textContent.trim().indexOf(label) === 0);
@@ -1217,7 +1294,7 @@ function setAppNavActive(label) {
    chrome (header, sidebar, breadcrumb); the analysis renders inside. */
 function showStabilizingMRC() {
   ["pmView", "wsView", "builderView", "caseLibraryView", "iberianView",
-   "gfmCaseView", "multiConverterCaseView"].forEach(function (id) {
+   "gfmCaseView", "multiConverterCaseView", "analysisHubView"].forEach(function (id) {
     var e = $(id); if (e) e.style.display = "none";
   });
   $("stabMrcView").style.display = "block";
@@ -1239,8 +1316,10 @@ function showStabilizingMRC() {
     var orig = window[name];
     if (typeof orig === "function") {
       window[name] = function () {
-        var v = document.getElementById("stabMrcView");
-        if (v) v.style.display = "none";
+        ["stabMrcView", "analysisHubView"].forEach(function (id) {
+          var v = document.getElementById(id);
+          if (v) v.style.display = "none";
+        });
         return orig.apply(this, arguments);
       };
     }

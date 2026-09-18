@@ -39,6 +39,22 @@ GET  /api/four_state/export/csv/{run_id} | /report/pdf/{run_id} | GET /api/four_
 P=20kW, v_nom=400V, R=0.2Ω, L=1.5mH, C=2.5mF, R_v=0.5Ω, K_i=50/s, k_m=500/s
 → x* = (50 A, 400 V, 0.7, 410 V); ‖f_cl(x*)‖ = 0; poles −60.085, −178.291±436.028j, −500; RH stable.
 
+## Shared analysis framework (Phase-1 engine)
+- `backend/ims_platform/framework/`: `interfaces.py` (STANDARD_WORKFLOW_STAGES = Model/Network → Analysis
+  → Disturbance → Simulation → IMS Results → Report; `SupportedOutputs`, `AnalysisDescriptor`, `Analysis`
+  Protocol, `build_envelope`, `CLAIM_LEVELS`), `registry.py` (ANALYSIS_REGISTRY + connected Case Library
+  descriptors), `analyses/stabilizing_mrc_analysis.py` (first fully-runnable analysis, delegates to the
+  verified stabilizing workflow — no math re-derivation).
+- FastAPI router `backend/routers/analysis.py` (`/api/analysis/*`): `registry`, `{id}/descriptor`,
+  `{id}/default_config`, `{id}/validate`, `{id}/run` → standardized IMS result envelope. MRC runs reuse the
+  four_state run cache so CSV/PDF export resolves framework run_ids (single dataset).
+- Explorer = analysis hub: explorer.html `showAnalysisHub()` (nav "Explorer → Analysis Hub", `#analysisHubView`)
+  fetches `/api/analysis/registry` and renders cards; RUNNABLE analyses open their surface, VALIDATED CASE
+  studies route to their existing preserved views. Adding a new analysis = one registry entry.
+- Standard envelope outputs (where supported): equilibrium, manifold/residual definition, residual trajectory,
+  contraction evidence, local stability, finite-horizon recovery, solver/constraint status — each tagged with
+  its claim_level; the four claim levels are never conflated.
+
 ## Auth
 None. No login/PIN gating.
 

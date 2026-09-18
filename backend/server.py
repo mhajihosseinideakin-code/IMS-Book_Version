@@ -64,6 +64,10 @@ async def get_status_checks():
 from routers.four_state import router as four_state_router
 api_router.include_router(four_state_router)
 
+# Shared IMS analysis framework routes (mounted on api_router -> /api/analysis/*)
+from routers.analysis import router as analysis_router
+api_router.include_router(analysis_router)
+
 # Include the router in the main app
 app.include_router(api_router)
 
