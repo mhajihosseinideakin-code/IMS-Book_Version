@@ -42,6 +42,7 @@ from ..core import Simulator
 from ..core.system import EquilibriumResult
 from ..ims import IntrinsicManifold, RecoverabilityAnalyzer
 from ..control import ScheduledLQRControl, MRCSynthesizer
+from ..network.controller import ConstantSetpointController
 from .auth import register_auth_routes
 from . import iberian_scenario
 from . import gfm_current_limit_case
@@ -589,6 +590,20 @@ def create_app() -> Flask:
                       _wrap(stage_simulate, network_mrc_simulate), methods=["POST"])
     app.add_url_rule("/api/project/<project_id>/ims_analysis", "ims_analysis",
                       _wrap(stage_ims_analysis, network_mrc_ims_analysis), methods=["POST"])
+
+    # Network + Auto-MRC: attach the synthesized MRC to the converter in the
+    # assembled network, then rerun baseline vs MRC on that identical network.
+    def _network_mrc_route(fn):
+        payload = request.get_json(force=True) or {}
+        try:
+            return jsonify(fn(payload))
+        except Exception as e:
+            return jsonify(error=str(e)), 400
+
+    app.add_url_rule("/api/network_mrc/apply", "network_mrc_apply_route",
+                      lambda: _network_mrc_route(network_mrc_apply), methods=["POST"])
+    app.add_url_rule("/api/network_mrc/closed_loop", "network_mrc_closed_loop_route",
+                      lambda: _network_mrc_route(network_mrc_closed_loop), methods=["POST"])
 
     def _custom_handler(stage_fn):
         def handler(stage_ignored=None):
@@ -2397,21 +2412,32 @@ def stage_ims_analysis(project: dict, payload: dict) -> dict:
 # taking a duty/setpoint input.
 # ----------------------------------------------------------------------
 
-def _build_network_mrc(payload: dict):
+def _build_network_mrc_with(payload: dict, apply_mrc: bool = True):
     p = payload.get("params", {})
     p_values = dict(R=float(p.get("R", 0.20)), L=float(p.get("L", 1.5e-3)), C=float(p.get("C", 2.5e-3)), P=float(p.get("P", 10e3)))
     km_value = float(payload.get("km", 500.0))
     v_bus_init = float(payload.get("v_bus_init", 400.0))
 
     synthesis = MRCSynthesizer(ConverterCPLPaper()).synthesize()
-    mrc_controller = SynthesizedMRCController(synthesis, p_values, km_value, state_order=[0, "bus", 1])
+    if apply_mrc:
+        # The synthesized MRC becomes the converter's ACTIVE controller.
+        controller = SynthesizedMRCController(synthesis, p_values, km_value, state_order=[0, "bus", 1])
+    else:
+        # Baseline: the SAME converter with NO MRC -- outer-loop actuation held
+        # at u = v_o_dot = 0 (open loop), so Before/After compares like-for-like.
+        controller = ConstantSetpointController(v_ref=0.0)
     electrical_model = ConverterCPLElectricalModel(R=p_values["R"], L=p_values["L"])
 
     net = Network("mrc_demo_network")
     net.add_bus(Bus(id="bus", C=p_values["C"], v_init=v_bus_init, v_min=v_bus_init * 0.1))
-    net.add_component(Converter(id="conv", bus="bus", electrical_model=electrical_model, controller=mrc_controller))
+    net.add_component(Converter(id="conv", bus="bus", electrical_model=electrical_model, controller=controller))
     net.add_component(ConstantPowerLoad(id="cpl", bus="bus", P=p_values["P"], v_floor=1e-6))
     system = AutomaticModelBuilder.build(net)
+    return system, net, synthesis, p_values, km_value, v_bus_init
+
+
+def _build_network_mrc(payload: dict):
+    system, _net, synthesis, p_values, km_value, v_bus_init = _build_network_mrc_with(payload, apply_mrc=True)
     return system, synthesis, p_values, km_value, v_bus_init
 
 
@@ -2534,4 +2560,70 @@ def network_mrc_ims_analysis(payload: dict) -> dict:
         "manifold_residual_explanation": _manifold_residual_explanation(),
         "recoverability_region_summary": _recoverability_region_summary(det_assessment, False),
         "note": "This project's manifold is 1-D and already shown by the simulate stage; no separate multi-point sweep is defined here (see architecture doc \u00a75.4).",
+    }
+
+
+def network_mrc_apply(payload: dict) -> dict:
+    """
+    Assign the synthesized MRC as the ACTIVE controller of the converter in
+    the assembled Network Builder model. Returns the converter/controller
+    configuration so the UI can show MRC as the converter's active synthesized
+    controller (not merely an analysis panel).
+    """
+    system, net, synthesis, p_values, km_value, v_bus_init = _build_network_mrc_with(payload, apply_mrc=True)
+    conv = next((c for c in net.components if isinstance(c, Converter)), None)
+    return {
+        "applied": True,
+        "converter": {
+            "id": conv.id if conv else "conv",
+            "bus": conv.bus if conv else "bus",
+            "electrical_model": type(conv.electrical_model).__name__ if conv else "ConverterCPLElectricalModel",
+            "active_controller": {
+                "type": "SynthesizedMRCController",
+                "label": "IMS-Native MRC (Symbolic Engine derived)",
+                "law": str(synthesis.control_expr),
+                "law_latex": synthesis.as_latex(),
+                "k_m": km_value,
+                "manifold_residual": "e_m = v_b - (v_o - R*i_l)",
+            },
+        },
+        "network_summary": _network_summary_from_network(net),
+        "note": ("The synthesized MRC is now the converter's active controller in the assembled network. "
+                 "Rerun the same network and disturbance to compare baseline vs MRC."),
+    }
+
+
+def network_mrc_closed_loop(payload: dict) -> dict:
+    """
+    Baseline (converter open-loop, u = v_o_dot = 0) vs MRC on the IDENTICAL
+    assembled network, equilibrium and disturbance. Runs the real
+    AutomaticModelBuilder-assembled system in both configurations.
+    """
+    x_star = np.array(payload["x_star"], dtype=float)
+    disturbance = payload.get("disturbance", [-5.0, 0.0, 0.0])
+    horizon = float(payload.get("horizon", 0.02))
+    disturbed = x_star + np.array(disturbance, dtype=float)
+    runs = {}
+    for key, apply_mrc in (("baseline", False), ("mrc", True)):
+        system, net, synthesis, p_values, km_value, _ = _build_network_mrc_with(payload, apply_mrc=apply_mrc)
+        R = p_values["R"]
+        sim = Simulator(system, method="RK45")
+        traj = sim.simulate(disturbed, (0.0, horizon), u=np.zeros(0), n_eval=400)
+        resid = [float(traj.x[0, k] - (traj.x[2, k] - R * traj.x[1, k])) for k in range(traj.x.shape[1])]
+        runs[key] = {
+            "t": traj.t.tolist(),
+            "v_bus": traj.x[0].tolist(), "i_L": traj.x[1].tolist(), "v_o": traj.x[2].tolist(),
+            "residual": resid, "success": bool(traj.success),
+            "final_deviation": float(np.linalg.norm(traj.x[:, -1] - x_star)),
+            "final_residual": float(resid[-1]), "max_abs_residual": float(np.max(np.abs(resid))),
+        }
+    return {
+        "state_names": ["v_bus", "i_L", "v_o"],
+        "x_star": x_star.tolist(), "disturbed_state": disturbed.tolist(),
+        "km": float(payload.get("km", 500.0)),
+        "baseline": runs["baseline"], "mrc": runs["mrc"],
+        "controller_applied": "SynthesizedMRCController on converter 'conv'",
+        "disclaimer": ("Baseline (converter open-loop, u = v_o_dot = 0) vs MRC on the IDENTICAL assembled "
+                       "network, equilibrium and disturbance. Numerical evidence on one scenario -- not a "
+                       "certified regional IMS guarantee."),
     }

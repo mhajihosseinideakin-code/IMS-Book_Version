@@ -58,7 +58,25 @@ P=20kW, v_nom=400V, R=0.2Ω, L=1.5mH, C=2.5mF, R_v=0.5Ω, K_i=50/s, k_m=500/s
 ## Auth
 None. No login/PIN gating.
 
-## General MRC Designer (now a downstream stage INSIDE the project workspace)
+## MRC attached to the converter in the assembled Network (real controller, not just a panel)
+- The Design MRC stage for `network_auto_mrc` now drives the ACTUAL assembled Network Builder model:
+  feasibility+synthesis+verify via `/api/mrc_designer/*` (on ConverterCPLPaper = the assembled model's math),
+  then two explicit sub-steps on the real assembled `Network`:
+  - **Apply MRC to Converter** → `POST /api/network_mrc/apply` (Flask app.py `network_mrc_apply`): builds the
+    assembled network with `SynthesizedMRCController` attached to converter `conv` and returns the converter's
+    active-controller config (type, law, k_m, manifold e_m). UI shows "MRC ACTIVE ON CONVERTER 'conv'".
+  - **Closed-Loop Simulation (baseline vs MRC)** → `POST /api/network_mrc/closed_loop`
+    (`network_mrc_closed_loop`): reruns the IDENTICAL `AutomaticModelBuilder`-assembled system + same
+    equilibrium + same disturbance in two configs — baseline (converter controller = `ConstantSetpointController(v_ref=0)`,
+    i.e. u=v_o_dot=0 open-loop) vs MRC. Returns both trajectories (v_bus,i_L,v_o), residual e_m, final
+    deviation/residual. Verified: baseline final |e_m|≈1.08 (unrecovered), MRC final |e_m|≈2e-4 (recovered).
+  - Backend refactor: `_build_network_mrc_with(payload, apply_mrc)` (app.py) is the shared builder;
+    `_build_network_mrc` delegates with apply_mrc=True (legacy behaviour unchanged). Routes registered via
+    `_network_mrc_route`. `ConstantSetpointController` imported from `..network.controller`.
+- Four-State Stabilising MRC remains a validated reference/benchmark only. Non-network projects still show an
+  honest "MRC Synthesis Not Established" with the mathematical reason (no arbitrary-network claim).
+
+## General MRC Designer (downstream stage INSIDE the project workspace)
 - **No longer a standalone Explorer item.** The MRC Designer is the project workspace's downstream
   stage `design_mrc` ("Design MRC Controller"), inserted in STAGES between `ims_analysis` and `report`
   (explorer.html). It inherits the project's assembled model, params, k_m, equilibrium and IMS results
