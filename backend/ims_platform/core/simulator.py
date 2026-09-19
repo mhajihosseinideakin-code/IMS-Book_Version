@@ -68,6 +68,7 @@ class Simulator:
         controller: Optional[Callable[[float, np.ndarray], np.ndarray]] = None,
         disturbances: Optional[List[Dict]] = None,
         n_eval: int = 400,
+        max_step: Optional[float] = None,
     ) -> TrajectoryResult:
         """
         Simulate the (possibly disturbed, possibly closed-loop) system.
@@ -108,10 +109,10 @@ class Simulator:
             n_pts = max(20, int(n_eval * (t1 - t0) / max(t_span[1] - t_span[0], 1e-9)))
             t_eval = np.linspace(t0, t1, n_pts)
 
-            sol = solve_ivp(
-                rhs, (t0, t1), x_current, method=self.method,
-                t_eval=t_eval, rtol=self.rtol, atol=self.atol, dense_output=False,
-            )
+            solve_kwargs = dict(t_eval=t_eval, rtol=self.rtol, atol=self.atol, dense_output=False)
+            if max_step is not None:
+                solve_kwargs["max_step"] = max_step
+            sol = solve_ivp(rhs, (t0, t1), x_current, method=self.method, **solve_kwargs)
 
             t_all.append(sol.t)
             x_all.append(sol.y)

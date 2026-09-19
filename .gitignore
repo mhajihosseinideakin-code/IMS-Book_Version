@@ -92,3 +92,4 @@ android-sdk/
 credentials.json
 *.key
 .credentials
+backend/.venv_demo/

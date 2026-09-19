@@ -275,3 +275,105 @@ class DroopController(Controller):
         v_ref = v_nom - p["R_droop"] * i_L
         d_nom = p.get("d_nominal", 0.5)
         return d_nom + p["Kp"] * (v_ref - v_bus) / v_nom_safe
+
+
+#: Numeric topology codes for AutoCurrentLoopMRCController.params["topology_code"]
+#: (kept numeric, not a string, because every other entry of a component's
+#: params dict is a plain float elsewhere in the platform -- e.g.
+#: network.assembler.AssembledNetworkSystem._collect_params/prefixed_params
+#: and every JSON-serialization path over params/state -- so a stray string
+#: value here would be a silent landmine for any code that assumes
+#: float(v) works on every params entry).
+TOPOLOGY_CODE = {"buck": 0.0, "boost": 1.0, "buckboost": 2.0}
+TOPOLOGY_CODE_INV = {v: k for k, v in TOPOLOGY_CODE.items()}
+
+
+def current_loop_mrc_duty(topology: str, i_L: float, v_bus: float, sigma: float, p: Dict) -> float:
+    """
+    Closed-form duty command for the automatically-derived, controller-
+    shaped current-loop MRC target manifold
+
+        phi(x) = i_L - i_bias - K_i * sigma,     sigma_dot = v_nom - v_bus
+
+    applied to a directly duty-modulated converter (network.converter_
+    topologies.BuckModel / BoostModel / BuckBoostModel), where the duty
+    ratio d enters di_L/dt directly (relative degree one on i_L itself,
+    by the converter's own averaged KVL relation) -- structurally the
+    same "controller-shaped target manifold" category as the book's
+    stabilizing-MRC construction (an integral-augmented linear target),
+    just anchored on i_L rather than on a free outer-loop voltage state,
+    because these topologies have no such free state for the duty ratio
+    to actuate through.
+
+    This closed form is produced by solving
+
+        L * di_L/dt(i_L, v_bus, d) = L * [ -k_m*(i_L - i_bias - K_i*sigma)
+                                            + K_i*(v_nom - v_bus) ]
+
+    for d, using each topology's own averaged inductor-voltage relation
+    (exactly the equations in network.converter_topologies). This
+    duplication is deliberate and load-bearing, not accidental: it lets
+    `mrc_designer.auto_manifold`'s independent SymPy derivation of the
+    same closed form be checked against this runtime formula (and both,
+    in turn, against a finite-difference derivative of the real,
+    assembled ConverterModel.local_dynamics) as three separate
+    computational paths for the same quantity --
+    tests/test_auto_manifold_mrc.py::test_symbolic_matches_numeric_law
+    is the regression that keeps them from silently drifting apart.
+
+    Raises ValueError for any topology this construction does not (yet)
+    cover -- never silently falls back to an unrelated formula.
+    """
+    v_nom = float(p["v_nom"]); K_i = float(p["K_i"]); k_m = float(p["k_m"])
+    i_bias = float(p["i_bias"])
+    v_in = float(p["v_in"]); L = float(p["L"]); R_L = float(p["R_L"])
+    topo = TOPOLOGY_CODE_INV.get(float(p["topology_code"]))
+
+    rhs_target = L * (-k_m * (i_L - i_bias - K_i * sigma) + K_i * (v_nom - v_bus))
+    if topo == "buck":
+        if abs(v_in) < 1e-12:
+            raise ValueError("current-loop MRC duty law is singular for buck topology: v_in == 0")
+        return (rhs_target + v_bus + R_L * i_L) / v_in
+    if topo == "boost":
+        if abs(v_bus) < 1e-9:
+            raise ValueError("current-loop MRC duty law is singular for boost topology: v_bus == 0")
+        return 1.0 - (v_in - R_L * i_L - rhs_target) / v_bus
+    if topo == "buckboost":
+        denom = v_in + v_bus
+        if abs(denom) < 1e-9:
+            raise ValueError("current-loop MRC duty law is singular for buck-boost topology: v_in + v_bus == 0")
+        return (rhs_target + v_bus + R_L * i_L) / denom
+    raise ValueError(f"current_loop_mrc_duty: unsupported topology code {p.get('topology_code')!r}")
+
+
+class AutoCurrentLoopMRCController(Controller):
+    """
+    Runtime `Controller` adapter for the automatically-derived current-
+    loop MRC law (`current_loop_mrc_duty` above). Structurally parallel
+    to `SynthesizedMRCController`'s role for the reduced-order voltage-
+    source model: this class contains no derivation of its own -- it is
+    only the object that lets `mrc_designer.auto_manifold`'s derived law
+    become the Converter's ACTUAL active controller (state, dynamics,
+    and control signal), attached through the same `Converter`/
+    `AutomaticModelBuilder` machinery as every other controller in this
+    file, on the real assembled Network Builder model -- not a
+    parallel/simulated stand-in.
+
+        d(sigma)/dt = v_nom - v_bus                    (voltage-error integrator)
+        d = current_loop_mrc_duty(topology, i_L, v_bus, sigma, p)   (duty command)
+    """
+
+    state_names = ("sigma",)
+    param_names = ("v_nom", "K_i", "k_m", "i_bias", "topology_code", "v_in", "L", "R_L")
+
+    def control_signal(self, v_bus, electrical_x, controller_x, u, p) -> float:
+        i_L = float(electrical_x[0])
+        sigma = float(controller_x[0])
+        return current_loop_mrc_duty("", i_L, v_bus, sigma, p)
+
+    def local_dynamics(self, v_bus, electrical_x, controller_x, u, p) -> np.ndarray:
+        v_nom = p["v_nom"] if u is None else u
+        return np.array([v_nom - v_bus])
+
+    def initial_state_guess(self) -> np.ndarray:
+        return np.array([0.0])
