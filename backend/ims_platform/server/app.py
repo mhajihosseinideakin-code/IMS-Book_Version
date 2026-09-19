@@ -604,6 +604,8 @@ def create_app() -> Flask:
                       lambda: _network_mrc_route(network_mrc_apply), methods=["POST"])
     app.add_url_rule("/api/network_mrc/closed_loop", "network_mrc_closed_loop_route",
                       lambda: _network_mrc_route(network_mrc_closed_loop), methods=["POST"])
+    app.add_url_rule("/api/network_mrc/inspect", "network_mrc_inspect_route",
+                      lambda: _network_mrc_route(network_mrc_inspect), methods=["POST"])
 
     def _custom_handler(stage_fn):
         def handler(stage_ignored=None):
@@ -2626,4 +2628,67 @@ def network_mrc_closed_loop(payload: dict) -> dict:
         "disclaimer": ("Baseline (converter open-loop, u = v_o_dot = 0) vs MRC on the IDENTICAL assembled "
                        "network, equilibrium and disturbance. Numerical evidence on one scenario -- not a "
                        "certified regional IMS guarantee."),
+    }
+
+
+def network_mrc_inspect(payload: dict) -> dict:
+    """
+    Honest per-model MRC feasibility for a USER-BUILT (assembled) network.
+    Inspects the real AutomaticModelBuilder system: control-affine split
+    f(x)+G(x)u (numeric), control authority of the assigned input, and whether
+    a validated SIGNED controlled-target manifold phi(x) exists. Never forces
+    SUPPORTED -- reports the exact mathematical reason.
+    """
+    spec = payload.get("network_spec")
+    if not spec:
+        raise ValueError("network_spec is required")
+    net, input_id = _build_network_from_spec(spec)
+    system = AutomaticModelBuilder.build(net, input_component_id=input_id, name=spec.get("name"))
+    n = system.n_states
+    m = len(system.input_names)
+
+    if payload.get("x_star") is not None:
+        x_star = np.array(payload["x_star"], dtype=float)
+    else:
+        x_star = system.find_equilibrium(system.initial_guess(), with_eigs=False).x_star
+
+    u0 = np.array(payload.get("nominal_input", system.default_input()), dtype=float)
+    if u0.shape[0] != m:
+        u0 = np.zeros(m)
+    p = system.params
+
+    # Numeric control-affine split at the operating point / operating input.
+    f0 = np.asarray(system.dynamics(0.0, x_star, u0, p), dtype=float)
+    G = np.zeros((n, m)); h = 1e-6
+    for j in range(m):
+        uj = u0.astype(float).copy(); uj[j] += h
+        G[:, j] = (np.asarray(system.dynamics(0.0, x_star, uj, p), dtype=float) - f0) / h
+    g_norm = float(np.linalg.norm(G))
+    control_authority = bool(g_norm > 1e-9)
+
+    reasons: List[str] = []
+    if not control_authority:
+        reasons.append(
+            f"the assigned exogenous input '{system.input_names[0] if m else '(none)'}' does not enter the "
+            f"state dynamics (G = d(f)/du = 0), so the model has no control authority to reshape any manifold")
+    reasons.append(
+        "no validated signed controlled-target manifold phi(x) exists for this assembled topology: IMS analysis "
+        "provides only a numeric distance-to-manifold residual, whose gradient is a unit normal to the sampled "
+        "curve rather than a controlled-invariant transverse coordinate, so it cannot justify synthesis")
+    reason = ("MRC synthesis not established for this Network Builder model. " + "; ".join(reasons) +
+              ". Establishing MRC for a new topology requires deriving a signed controlled-target manifold via "
+              "control.mrc_synthesis (a symbolic-engine step), which is not available generically for arbitrary "
+              "assembled networks. The validated synthesis path is the Network + Auto-MRC (assembled Converter-CPL) "
+              "model; the Four-State Stabilising MRC remains a reference benchmark only.")
+    return {
+        "mrc_established": False,
+        "establishment_basis": "none",
+        "dim_x": int(n), "dim_u": int(m), "input_names": list(system.input_names),
+        "state_names": list(system.state_names),
+        "operating_point": [float(v) for v in x_star],
+        "G_method": "finite_difference", "G_norm": g_norm, "control_authority": control_authority,
+        "manifold_method": "numeric_distance_to_manifold", "controlled_target_manifold": False,
+        "dim_phi": None, "A": None, "rank_A": None, "condition_number": None,
+        "reason": reason,
+        "note": "Honest per-model feasibility computed on the actual assembled Network Builder system.",
     }

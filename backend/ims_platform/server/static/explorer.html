@@ -3461,6 +3461,8 @@ function renderDesignMrcStage(el) {
   }
   ctxPanel.innerHTML = ch; el.appendChild(ctxPanel);
 
+  if (p.category === "custom_network") { renderCustomMrcFeasibility(el); return; }
+
   if (!model_id) {
     var np = document.createElement("div"); np.className = "panel";
     np.innerHTML = "<div class='panel-title'>MRC Feasibility</div><div style='margin-bottom:8px;'>" + dmStatusBadge("not_established") + "</div>" +
@@ -3652,6 +3654,49 @@ function exportClosedLoopCsv(cl) {
   var a = document.createElement("a"); a.href = URL.createObjectURL(blob);
   a.download = "network_mrc_baseline_vs_mrc.csv"; a.click();
   setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+}
+
+async function runCustomFeasibility() {
+  var btn = $("customFeasBtn"); if (btn) { btn.disabled = true; btn.textContent = "Checking feasibility\u2026"; }
+  var box = $("wsError"); if (box) box.style.display = "none";
+  try {
+    var eq = stageResults.equilibrium;
+    var body = { network_spec: builderSpec, x_star: eq && eq.x_star, nominal_input: formState.nominal_input };
+    var res = await postJson("/api/network_mrc/inspect", body);
+    stageResults.design_mrc = { status: "not_established", custom: true, inspect: res };
+    renderWorkspace();
+  } catch (e) {
+    var b = $("wsError"); if (b) { b.style.display = "block"; b.textContent = "Feasibility check failed: " + (e && e.message ? e.message : String(e)); }
+  } finally {
+    var b2 = $("customFeasBtn"); if (b2) { b2.disabled = false; b2.textContent = "Run MRC Feasibility Check"; }
+  }
+}
+
+function renderCustomMrcFeasibility(el) {
+  var r = stageResults.design_mrc;
+  if (!r || !r.inspect) {
+    var runPanel = document.createElement("div"); runPanel.className = "panel no-print";
+    runPanel.innerHTML = "<div class='panel-title'>MRC Feasibility Check (assembled Network Builder model)</div>" +
+      "<div class='help-text'>Inspects the actual assembled system: control-affine split f(x)+G(x)u, control authority of the assigned input, and whether a validated signed controlled-target manifold \u03C6(x) exists. Honest per-model \u2014 not forced to SUPPORTED.</div>";
+    var b = document.createElement("button"); b.className = "run-stage"; b.id = "customFeasBtn";
+    b.textContent = "Run MRC Feasibility Check"; b.onclick = runCustomFeasibility;
+    runPanel.appendChild(b); el.appendChild(runPanel);
+    appendDesignMrcClaims(el); appendContinueToReport(el); return;
+  }
+  var f = r.inspect; var authOk = !!f.control_authority;
+  var fp = document.createElement("div"); fp.className = "panel";
+  var h = "<div class='panel-title'>MRC Feasibility \u2014 assembled model diagnostics</div>" +
+    "<div style='margin-bottom:10px;'>" + dmStatusBadge("not_established") + "</div><div class='info-grid'>" +
+    "<div class='info-card'><div class='lbl'>dim x</div><div class='val'>" + (f.dim_x != null ? f.dim_x : "\u2014") + "</div></div>" +
+    "<div class='info-card'><div class='lbl'>dim u</div><div class='val'>" + (f.dim_u != null ? f.dim_u : "\u2014") + "</div></div>" +
+    "<div class='info-card'><div class='lbl'>\u2016G(x*)\u2016</div><div class='val'>" + dmNum(f.G_norm, 3) + "</div></div>" +
+    "<div class='info-card'><div class='lbl'>input</div><div class='val' style='font-size:11px;'>" + ((f.input_names && f.input_names[0]) || "\u2014") + "</div></div></div>";
+  h += "<div style='margin-top:10px;display:flex;flex-direction:column;gap:6px;'>" +
+    "<div style='font-size:11.5px;'><span style='color:" + (authOk ? "#3FE0A8" : "#FFB454") + ";'>\u25CF</span> Control channel f(x)+G(x)u: <b>" + (authOk ? "PRESENT" : "ABSENT") + "</b> (G " + (authOk ? "enters" : "does not enter") + " the state dynamics)</div>" +
+    "<div style='font-size:11.5px;'><span style='color:#FFB454;'>\u25CF</span> Signed controlled-target manifold \u03C6(x): <b>NOT AVAILABLE</b> (IMS provides only a numeric distance-to-manifold residual)</div></div>";
+  h += "<div class='help-text' style='margin-top:10px;'>" + (f.reason || "") + "</div>";
+  fp.innerHTML = h; el.appendChild(fp);
+  appendDesignMrcClaims(el); appendContinueToReport(el);
 }
 
 function appendDesignMrcClaims(el) {

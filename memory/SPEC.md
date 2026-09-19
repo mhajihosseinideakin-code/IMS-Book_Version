@@ -58,6 +58,24 @@ P=20kW, v_nom=400V, R=0.2Ω, L=1.5mH, C=2.5mF, R_v=0.5Ω, K_i=50/s, k_m=500/s
 ## Auth
 None. No login/PIN gating.
 
+## MRC feasibility for user-built Network Builder models (investigation + fix)
+Root cause of "every Network Builder model returns NOT ESTABLISHED" was two-fold:
+- **Integration bug (fixed):** the frontend `designerModelForProject` returned `null` for `custom_network`,
+  so the Design MRC stage showed a canned "not established" message WITHOUT ever inspecting the assembled
+  model. Now `custom_network` calls `POST /api/network_mrc/inspect` (`network_mrc_inspect` in app.py) which
+  assembles the real system and reports genuine per-model diagnostics: dim_x, dim_u, numeric control-affine
+  split f(x)+G(x)u, ‖G‖ / control authority, and whether a signed controlled-target manifold exists.
+- **Mathematical (not a bug):** even with f(x),G(x) available, there is NO validated signed controlled-target
+  manifold φ(x) for arbitrary topologies. IMS analysis provides only a numeric distance-to-manifold residual
+  (`IntrinsicManifold.residual` = distance; its gradient is a unit normal to the sampled curve, not a
+  controlled-invariant transverse coordinate), so A=Dφ·G cannot justify synthesis. Correctly "not established".
+Empirical trace (Network Builder→Assembly→IMS→Feasibility): boost+CPL(PI) → dim_u=1, ‖G‖>0 (control channel
+present) but no φ → not established; buck+impedance(constant-duty) → control channel present too, still no φ.
+The honest classification: analytic SUPPORTED only for the registered assembled Converter-CPL (Network+Auto-MRC);
+Four-State remains a benchmark; all user-built topologies are "Not Established" with the specific reason.
+Fix is honest — never forces SUPPORTED. New endpoint `/api/network_mrc/inspect`; frontend
+`renderCustomMrcFeasibility`/`runCustomFeasibility`.
+
 ## MRC attached to the converter in the assembled Network (real controller, not just a panel)
 - The Design MRC stage for `network_auto_mrc` now drives the ACTUAL assembled Network Builder model:
   feasibility+synthesis+verify via `/api/mrc_designer/*` (on ConverterCPLPaper = the assembled model's math),
