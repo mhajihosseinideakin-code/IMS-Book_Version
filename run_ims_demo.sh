@@ -95,7 +95,10 @@ fi
 if [ -d "$FRONTEND_DIR" ]; then
   if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
     echo "==> Installing frontend dependencies (first run only, can take a couple of minutes)"
-    ( cd "$FRONTEND_DIR" && npm install --silent )
+    # --legacy-peer-deps: this dependency graph trips a known npm/arborist
+    # crash ("Cannot read properties of null (reading 'edgesOut')") under
+    # strict peer-dep resolution on newer npm; legacy resolution avoids it.
+    ( cd "$FRONTEND_DIR" && npm install --legacy-peer-deps )
   fi
 else
   echo "warning: $FRONTEND_DIR not found -- Analysis Hub / Stabilising MRC (/mrc) will 404 without it." >&2
