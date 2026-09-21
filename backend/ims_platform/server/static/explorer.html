@@ -3345,6 +3345,7 @@ function dmNum(v, p) {
 
 function dmStatusBadge(status) {
   if (status === "supported") return "<div style='display:inline-block;font-size:11px;font-weight:700;color:#3FE0A8;border:1px solid #3FE0A8;border-radius:4px;padding:3px 10px;'>MRC SYNTHESIS SUPPORTED</div>";
+  if (status === "supported_reshaped") return "<div style='display:inline-block;font-size:11px;font-weight:700;color:#3FE0A8;border:1px solid #3FE0A8;border-radius:4px;padding:3px 10px;'>MRC SYNTHESIS SUPPORTED — RESHAPED MANIFOLD</div>";
   if (status === "diagnostic") return "<div style='display:inline-block;font-size:11px;font-weight:700;color:#6FC6FF;border:1px solid #6FC6FF;border-radius:4px;padding:3px 10px;'>DIAGNOSTIC / FEASIBILITY ONLY</div>";
   return "<div style='display:inline-block;font-size:11px;font-weight:700;color:#FFB454;border:1px solid #FFB454;border-radius:4px;padding:3px 10px;'>MRC SYNTHESIS NOT ESTABLISHED</div>";
 }
@@ -3575,6 +3576,13 @@ function exportClosedLoopCsv(cl) {
 
 function customMrcStatusKey(pipelineStatus) {
   if (pipelineStatus === "MRC_SYNTHESIS_SUPPORTED") return "supported";
+  // Bus-voltage-anchored second-candidate (M2, "reshaped manifold")
+  // outcome: a genuine, feasibility-and-stability-gated SUPPORTED result
+  // (see run_auto_mrc_pipeline / attempt_bus_voltage_manifold_reshaping
+  // on the backend) -- must be its own status key, not silently folded
+  // into "not_established" (that mismatch between the UI and the actual
+  // pipeline result was found during end-to-end validation).
+  if (pipelineStatus === "MRC_SYNTHESIS_SUPPORTED_VIA_RESHAPED_MANIFOLD") return "supported_reshaped";
   if (pipelineStatus === "MRC_FEASIBILITY_DIAGNOSTIC_ONLY") return "diagnostic";
   return "not_established";
 }
@@ -3650,14 +3658,15 @@ function renderCustomMrcFeasibility(el) {
 
   if (r.status === "not_established") { appendDesignMrcClaims(el); appendContinueToReport(el); return; }
 
+  var isReshaped = (r.status === "supported_reshaped");
   var sp = document.createElement("div"); sp.className = "panel";
-  sp.innerHTML = "<div class='panel-title'>Synthesized control law &nbsp; u = \u03BA(x)</div>" +
+  sp.innerHTML = "<div class='panel-title'>" + (isReshaped ? "M1 \u2014 current-anchored candidate \u03C6\u2081 (rejected: unstable reduced dynamics)" : "Synthesized control law &nbsp; u = \u03BA(x)") + "</div>" +
     "<div class='law-box' style='font-size:12.5px;word-break:break-word;'>" + (pr.control_law_latex || pr.derived_control_law || "") + "</div>";
   el.appendChild(sp);
 
   var ce = pr.contraction_residual || {};
   var vp = document.createElement("div"); vp.className = "panel";
-  var vh = "<div class='panel-title'>Closed-loop verification</div><div class='info-grid'>" +
+  var vh = "<div class='panel-title'>" + (isReshaped ? "M1 closed-loop verification (diagnostic only, not the active controller)" : "Closed-loop verification") + "</div><div class='info-grid'>" +
     "<div class='info-card'><div class='lbl'>\u03BB\u22A5 vs \u2212k_m</div><div class='val'>" + dmCplx(pr.transverse_eigenvalue) + (pr.transverse_matches_km ? " \u2713" : " \u2717") + "</div></div>" +
     "<div class='info-card'><div class='lbl'>residual rel-err</div><div class='val'>" + dmNum(ce.max_relative_error, 3) + "</div></div>" +
     "<div class='info-card'><div class='lbl'>tangential stable</div><div class='val'>" + (pr.tangential_locally_stable ? "yes" : "no") + "</div></div></div>";
@@ -3666,6 +3675,32 @@ function renderCustomMrcFeasibility(el) {
     "<span style='font-size:10.5px;border:1px solid #10B981;color:#10B981;border-radius:4px;padding:2px 7px;'>exact transverse residual identity: " + (ce.identity || "") + "</span>" +
     "<span style='font-size:10.5px;border-radius:4px;padding:2px 7px;border:1px solid " + (pr.tangential_locally_stable ? "#3FE0A8;color:#3FE0A8" : "#FFB454;color:#FFB454") + ";'>local tangential stability: " + (pr.tangential_locally_stable ? "stable" : "NOT guaranteed") + "</span></div>";
   vp.innerHTML = vh; el.appendChild(vp);
+
+  if (isReshaped && pr.manifold_reshaping) {
+    var mr = pr.manifold_reshaping;
+    var chosen = mr.chosen_entry || {};
+    var tnd = chosen.tangent_normal_decomposition || {};
+    var rh = tnd.routh_hurwitz_2x2 || {};
+    var feas = chosen.physical_feasibility || {};
+    var mrp = document.createElement("div"); mrp.className = "panel";
+    var mh = "<div class='panel-title'>M2 \u2014 bus-voltage-anchored reshaped candidate \u03C6\u2082 (ACTIVE, both transverse and reduced dynamics stable)</div>" +
+      "<div class='law-box' style='font-size:12px;word-break:break-word;margin-bottom:10px;'>" + (mr.control_law2_latex || "") + "</div>" +
+      "<div class='info-grid'>" +
+      "<div class='info-card'><div class='lbl'>selected R_v</div><div class='val'>" + dmNum(mr.chosen_R_v) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>K_i</div><div class='val'>" + dmNum(mr.K_i) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>k_m</div><div class='val'>" + dmNum(mr.k_m) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>A2(x) at candidate</div><div class='val'>" + dmNum(chosen.A2_center) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>\u03BB\u22A5 (transverse)</div><div class='val'>" + dmCplx(chosen.transverse_eigenvalue) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>\u03B1\u2225 (reduced)</div><div class='val'>" + dmNum(chosen.alpha_parallel) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>trace(J\u2225)</div><div class='val'>" + dmNum(rh.trace) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>det(J\u2225)</div><div class='val'>" + dmNum(rh.det) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>Routh-Hurwitz</div><div class='val'>" + (rh.hurwitz_stable ? "STABLE" : "unstable") + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>equilibrium duty</div><div class='val'>" + dmNum(feas.duty_at_equilibrium) + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>duty feasible</div><div class='val'>" + (feas.feasible ? "yes" : "no") + "</div></div>" +
+      "<div class='info-card'><div class='lbl'>saturated at eq.</div><div class='val'>" + (feas.duty_saturated ? "yes" : "no") + "</div></div></div>" +
+      "<div class='help-text' style='margin-top:8px;'><b>" + (pr.classification || "") + "</b> \u2014 the reshaped manifold is only classified supported because BOTH \u03BB\u22A5&lt;0 and \u03B1\u2225&lt;0 (full Routh-Hurwitz, not trace alone) AND the equilibrium duty is within the converter's physical [0.02, 0.98] clamp.</div>";
+    mrp.innerHTML = mh; el.appendChild(mrp);
+  }
 
   // ---- Apply MRC to Converter (actual Network Builder converter) ----
   var applied = r.applied;
@@ -3725,6 +3760,27 @@ function renderCustomMrcFeasibility(el) {
       csvBtn2.onclick = function () { exportAutoClosedLoopCsv(clc); };
       mp2.appendChild(csvBtn2); el.appendChild(mp2);
       setTimeout(function () { drawAutoClosedLoopCharts(clc, "autoClIlChart", "autoClVbChart"); }, 0);
+
+      // Baseline vs M1 vs M2, identical conditions -- only present for the
+      // reshaped-manifold (M2) outcome. Shows the distinction explicitly:
+      // M1 achieves exact transverse attraction to its manifold but has
+      // UNSTABLE reduced dynamics, while M2 reshapes the manifold so both
+      // the transverse and reduced dynamics are locally stable.
+      if (cl.baseline_m1_m2_comparison) {
+        var b3 = cl.baseline_m1_m2_comparison.baseline || {};
+        var m1r = cl.baseline_m1_m2_comparison.m1 || {};
+        var m2r = cl.baseline_m1_m2_comparison.m2 || {};
+        var tp = document.createElement("div"); tp.className = "panel";
+        var th = "<div class='panel-title'>Baseline vs M1 vs M2 — identical network, equilibrium, disturbance, solver, tolerances and horizon</div>" +
+          "<table style='width:100%;border-collapse:collapse;font-size:12px;' data-testid='baseline-m1-m2-metrics'>" +
+          "<tr style='color:var(--text-dim);text-align:left;font-size:10px;text-transform:uppercase;'><th style='padding:3px 8px 3px 0;'>Metric</th><th>Baseline</th><th>M1 (φ₁, current-anchored)</th><th>M2 (φ₂, reshaped, ACTIVE)</th></tr>" +
+          "<tr><td style='padding:3px 8px 3px 0;'>final ‖x−x*‖</td><td>" + dmNum(b3.final_deviation) + "</td><td>" + dmNum(m1r.final_deviation) + "</td><td style='color:#6EE7B7;'>" + dmNum(m2r.final_deviation) + "</td></tr>" +
+          "<tr><td style='padding:3px 8px 3px 0;'>recovered within horizon</td><td>" + (b3.recovered ? "yes" : "no") + "</td><td style='color:" + (m1r.recovered ? "#6EE7B7" : "#FF6B6B") + ";'>" + (m1r.recovered ? "yes" : "no") + "</td><td style='color:#6EE7B7;'>" + (m2r.recovered ? "yes" : "no") + "</td></tr>" +
+          "<tr><td style='padding:3px 8px 3px 0;'>saturated at any point</td><td>—</td><td>" + (m1r.saturated_at_any_point ? "yes" : "no") + "</td><td>" + (m2r.saturated_at_any_point ? "yes" : "no") + "</td></tr>" +
+          "<tr><td style='padding:3px 8px 3px 0;'>saturation fraction of horizon</td><td>—</td><td>" + dmNum(m1r.saturation_fraction_of_horizon, 3) + "</td><td>" + dmNum(m2r.saturation_fraction_of_horizon, 3) + "</td></tr>" +
+          "</table><div class='help-text' style='margin-top:8px;'>M1 achieves fast transverse attraction to its manifold φ₁, but its reduced/tangential dynamics are unstable, so the state does not stay near equilibrium; M2 reshapes the target manifold (φ₂, bus-voltage-anchored) so that both the transverse AND reduced dynamics are locally stable. Finite-horizon simulation evidence on the actual assembled model — not a certified regional IMS guarantee.</div>";
+        tp.innerHTML = th; el.appendChild(tp);
+      }
     }
   }
 
@@ -4171,13 +4227,22 @@ function renderStageResults(stage) {
       }
       if (det.ims_conditions) {
         var ic = det.ims_conditions;
-        var chk = function (v) { return v === true ? "\u2713" : v === false ? "\u2717" : "\u2014"; };
-        detPanel.innerHTML += "<div class='panel-title' style='margin-top:14px;'>IMS conditions (Definition IV.3, approximate)</div>" +
-          "<div class='help-text' style='margin-bottom:8px;'>A computational proxy, not a rigorous proof \u2014 rigorously verifying the spectral gap condition (transverse vs. tangential eigenvalues specifically) requires an analytic tangent/normal split of the manifold not generally available here. A \u2717 can reflect a real, known property of the underlying model (e.g. a positive eigenvalue at equilibrium) even when the trajectory still recovers \u2014 this is consistent with the papers' own point that manifold attractivity and equilibrium-eigenvalue stability are different properties.</div>" +
+        var chk = function (v) {
+          if (v === "SATISFIED") return "\u2713";
+          if (v === "VIOLATED") return "\u2717";
+          if (v === true) return "\u2713 (empirical)";
+          if (v === false) return "\u2717 (empirical)";
+          return "\u2014 not established";
+        };
+        detPanel.innerHTML += "<div class='panel-title' style='margin-top:14px;'>IMS conditions (Definition IV.3, tri-state)</div>" +
+          "<div class='help-text' style='margin-bottom:8px;'>SATISFIED / VIOLATED are only reported when the underlying quantity was actually computed; \u201cnot established\u201d is a genuine third state (not a failure) for claims this pathway lacks the analytic structure to evaluate \u2014 e.g. transverse/reduced-dynamics stability requires the manifold's own target rate k_m, which the generic IMS Analysis pathway does not have. These are five separate claims, never inferred from one another.</div>" +
           "<div class='info-grid'>" +
+          "<div class='info-card'><div class='lbl'>Full-system local stability</div><div class='val'>" + chk(ic.full_system_local_stability) + "</div></div>" +
           "<div class='info-card'><div class='lbl'>Normal hyperbolicity</div><div class='val'>" + chk(ic.normal_hyperbolicity) + "</div></div>" +
-          "<div class='info-card'><div class='lbl'>Exponential attraction</div><div class='val'>" + chk(ic.exponential_transverse_attraction) + "</div></div>" +
-          "<div class='info-card'><div class='lbl'>Reduced dynamics stable</div><div class='val'>" + chk(ic.reduced_dynamics_stable) + "</div></div>" +
+          "<div class='info-card'><div class='lbl'>Transverse contraction (analytic)</div><div class='val'>" + chk(ic.transverse_contraction) + "</div></div>" +
+          "<div class='info-card'><div class='lbl'>Reduced dynamics stable (analytic)</div><div class='val'>" + chk(ic.reduced_dynamics_stable) + "</div></div>" +
+          "<div class='info-card'><div class='lbl'>Empirical finite-horizon recovery</div><div class='val'>" + chk(ic.empirical_finite_horizon_recovery) + "</div></div>" +
+          "<div class='info-card'><div class='lbl'>Certified regional IMS</div><div class='val'>" + chk(ic.certified_regional_ims) + "</div></div>" +
           "<div class='info-card'><div class='lbl'>Overall IMS status</div><div class='val'>" + ic.overall_status + "</div></div>" +
           "</div>";
       }
@@ -5013,13 +5078,22 @@ function buildReportBodyHtml(forExport) {
       }
       if (det.ims_conditions) {
         var ic = det.ims_conditions;
-        var chk2 = function (v) { return v === true ? "Satisfied" : v === false ? "Not satisfied" : "n/a"; };
-        html += "<div style='font-size:11px;text-transform:uppercase;color:var(--text-dim,#888);margin:10px 0 4px;'>IMS conditions (Definition IV.3, approximate)</div>" +
-          "<p style='font-size:11.5px;color:var(--text-dim,#888);'>A computational proxy, not a rigorous proof of Fenichel's theorem's hypotheses; a \"not satisfied\" result can reflect a real, known model property rather than a loss of recoverability \u2014 see the platform notes.</p>" +
+        var chk2 = function (v) {
+          if (v === "SATISFIED") return "Satisfied";
+          if (v === "VIOLATED") return "Violated";
+          if (v === true) return "Observed (empirical)";
+          if (v === false) return "Not observed (empirical)";
+          return "Not established";
+        };
+        html += "<div style='font-size:11px;text-transform:uppercase;color:var(--text-dim,#888);margin:10px 0 4px;'>IMS conditions (Definition IV.3, tri-state)</div>" +
+          "<p style='font-size:11.5px;color:var(--text-dim,#888);'>\"Not established\" is a genuine third state, not a failure \u2014 it means this pathway lacks the analytic structure (e.g. the manifold's own target rate k_m) to evaluate that specific claim. These are separate claims and are never inferred from one another.</p>" +
           "<table style='width:100%;border-collapse:collapse;font-size:12px;'>" +
+          "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Full-system local stability</td><td>" + chk2(ic.full_system_local_stability) + "</td></tr>" +
           "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Normal hyperbolicity</td><td>" + chk2(ic.normal_hyperbolicity) + "</td></tr>" +
-          "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Exponential transverse attraction</td><td>" + chk2(ic.exponential_transverse_attraction) + "</td></tr>" +
-          "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Reduced dynamics stable</td><td>" + chk2(ic.reduced_dynamics_stable) + "</td></tr>" +
+          "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Transverse contraction (analytic)</td><td>" + chk2(ic.transverse_contraction) + "</td></tr>" +
+          "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Reduced dynamics stable (analytic)</td><td>" + chk2(ic.reduced_dynamics_stable) + "</td></tr>" +
+          "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Empirical finite-horizon recovery</td><td>" + chk2(ic.empirical_finite_horizon_recovery) + "</td></tr>" +
+          "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Certified regional IMS</td><td>" + chk2(ic.certified_regional_ims) + "</td></tr>" +
           "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Overall IMS status</td><td><b>" + ic.overall_status + "</b></td></tr>" +
           "</table>";
       }

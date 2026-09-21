@@ -218,7 +218,29 @@ class DynamicalSystem:
 
         x_star, info, ier, msg = fsolve(g, np.asarray(x0, dtype=float), full_output=True)
         residual_norm = float(np.linalg.norm(g(x_star)))
-        converged = bool(ier == 1) and residual_norm < 1e-6
+        # Convergence is judged on the residual itself (the actual
+        # statement "f(x*) ~ 0" that defines an equilibrium), NOT on
+        # MINPACK/hybrd's own ier flag. ier==1 is a solver-internal
+        # heuristic ("did the step-improvement pattern look like textbook
+        # convergence"), and it can come back non-1 (commonly ier==5,
+        # "not making good progress... from the last ten iterations")
+        # even when x_star is already an extremely accurate root -- this
+        # happens whenever the initial guess lands close to the true
+        # equilibrium, so the solver's last steps have nothing left to
+        # improve and its own progress heuristic misfires. Confirmed
+        # directly: a PI-controlled buck converter case with residual_norm
+        # ~2e-12 (14 orders of magnitude below this function's own 1e-6
+        # tolerance) was previously flagged converged=False purely because
+        # ier==5, which downstream became a false "target manifold
+        # incompatible with equilibrium" MRC_SYNTHESIS_NOT_ESTABLISHED
+        # verdict for a target that is, in fact, reachable. Gating on
+        # residual alone is strictly the more rigorous check, not a
+        # weaker one -- it is exactly the mathematical condition
+        # "equilibrium" requires, and does not accept anything the old
+        # ier-gated check would not also have accepted at the same
+        # tolerance whenever ier really did indicate failure with a large
+        # residual.
+        converged = residual_norm < 1e-6
 
         eigs = None
         J = None

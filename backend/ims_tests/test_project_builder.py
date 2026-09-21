@@ -19,6 +19,7 @@ every other numerical addition in this project:
    before the fix made it a required, explicit choice instead.
 """
 import numpy as np
+import pytest
 
 from ims_platform.server.app import _build_network_from_spec
 from ims_platform.network import AutomaticModelBuilder, BoostModel, ConstantPowerLoad
@@ -815,12 +816,17 @@ def test_ims_conditions_check_reflects_a_real_known_equilibrium_property():
     equilibrium (see models/converter_cpl_paper.py's own docstring:
     "a structurally positive tangential mode... at the high-voltage
     equilibrium"). Confirmed directly: eigenvalues are approximately
-    [-500, ~0, +25]. This test locks in that the IMS-conditions check
-    correctly reports normal_hyperbolicity=False here -- an honest,
-    real finding illustrating the papers' own central argument that
-    manifold attractivity and traditional equilibrium-eigenvalue
-    stability are different properties, not a bug to be silently
-    smoothed over.
+    [-500, ~0, +25]. This test locks in that the tri-state IMS-conditions
+    check correctly reports full_system_local_stability=VIOLATED (the
+    +25 eigenvalue) and normal_hyperbolicity=VIOLATED (the ~0 eigenvalue
+    sits on the imaginary axis, within the check's finite-difference-
+    noise-aware tolerance) here -- an honest, real finding illustrating
+    the papers' own central argument that manifold attractivity and
+    traditional equilibrium-eigenvalue stability are different
+    properties, not a bug to be silently smoothed over. This is the
+    generic, structure-agnostic pathway (no k_m given), so the analytic
+    transverse/reduced-dynamics claims are correctly NOT_ESTABLISHED --
+    never inferred from the full-system finding above.
     """
     from ims_platform.server.app import _build_network_mrc, _check_ims_conditions
     import numpy as np
@@ -830,9 +836,75 @@ def test_ims_conditions_check_reflects_a_real_known_equilibrium_property():
     eigs = np.linalg.eigvals(system.jacobian(x_star, np.zeros(0)))
     assert any(e.real > 1.0 for e in eigs)  # confirms the known positive eigenvalue is genuinely present
     conditions = _check_ims_conditions(eigs, 275.5, 6.5e-6, 0.1)
-    assert conditions["normal_hyperbolicity"] is False
-    assert conditions["exponential_transverse_attraction"] is True
-    assert conditions["overall_status"] == "Violated"
+    assert conditions["full_system_local_stability"] == "VIOLATED"
+    assert conditions["normal_hyperbolicity"] == "VIOLATED"
+    assert conditions["transverse_contraction"] == "NOT_ESTABLISHED"
+    assert conditions["reduced_dynamics_stable"] == "NOT_ESTABLISHED"
+    assert conditions["empirical_finite_horizon_recovery"] is True
+    assert conditions["overall_status"] == "VIOLATED"
+
+
+def test_ims_conditions_not_established_is_never_confused_with_violated():
+    """Task item 2's central requirement: 'not demonstrated/not computed'
+    must never be reported as mathematically 'violated'. Without a
+    transverse_target_rate (the generic, structure-agnostic pathway's
+    actual situation), the transverse/reduced-dynamics claims must come
+    back NOT_ESTABLISHED even when the full-system eigenvalues themselves
+    are all comfortably stable -- NOT_ESTABLISHED is a genuine third
+    state, distinct from both SATISFIED and VIOLATED."""
+    from ims_platform.server.app import _check_ims_conditions
+    import numpy as np
+
+    stable_eigs = np.array([-10.0 + 0j, -20.0 + 5j, -20.0 - 5j])
+    conditions = _check_ims_conditions(stable_eigs, contraction_rate=5.0, final_residual=1e-4, tolerance=0.1)
+    assert conditions["full_system_local_stability"] == "SATISFIED"
+    assert conditions["normal_hyperbolicity"] == "SATISFIED"
+    # never inferred from the full-system finding above, and never
+    # reported as VIOLATED just because it was never computed:
+    assert conditions["transverse_contraction"] == "NOT_ESTABLISHED"
+    assert conditions["reduced_dynamics_stable"] == "NOT_ESTABLISHED"
+    assert conditions["certified_regional_ims"] == "NOT_ESTABLISHED"
+    # overall_status must also stay NOT_ESTABLISHED, not be upgraded to
+    # SATISFIED on the strength of the full-system claim alone
+    assert conditions["overall_status"] == "NOT_ESTABLISHED"
+
+
+def test_ims_conditions_transverse_target_rate_enables_genuine_analytic_split():
+    """When a manifold's own target contraction rate k_m IS known (the
+    network_mrc pathway's situation), the transverse/reduced-dynamics
+    claims become analytically computable -- SATISFIED here, not merely
+    NOT_ESTABLISHED -- because the eigenvalue closest to -k_m is
+    identified as transverse and the rest are genuinely tangential and
+    stable."""
+    from ims_platform.server.app import _check_ims_conditions
+    import numpy as np
+
+    # -500 is the transverse mode (matches k_m); -60.1 and -178.3+-436j are
+    # tangential and all strictly stable -- mirrors the validated four-state benchmark.
+    eigs = np.array([-500.0 + 0j, -60.0849 + 0j, -178.2909 + 436.0281j, -178.2909 - 436.0281j])
+    conditions = _check_ims_conditions(eigs, contraction_rate=500.0, final_residual=0.0, tolerance=0.1,
+                                       transverse_target_rate=500.0)
+    assert conditions["full_system_local_stability"] == "SATISFIED"
+    assert conditions["normal_hyperbolicity"] == "SATISFIED"
+    assert conditions["transverse_contraction"] == "SATISFIED"
+    assert conditions["reduced_dynamics_stable"] == "SATISFIED"
+    assert conditions["overall_status"] == "SATISFIED"
+    assert conditions["transverse_eigenvalue"]["re"] == pytest.approx(-500.0)
+    assert len(conditions["tangential_eigenvalues"]) == 3
+
+
+def test_ims_conditions_transverse_target_rate_can_reveal_genuine_violation():
+    """A k_m that does NOT match any actual eigenvalue means the closed-
+    loop system is not actually contracting transversally at the demanded
+    rate -- this must be reported as VIOLATED, not silently accepted."""
+    from ims_platform.server.app import _check_ims_conditions
+    import numpy as np
+
+    eigs = np.array([-10.0 + 0j, -20.0 + 0j, -30.0 + 0j])
+    conditions = _check_ims_conditions(eigs, contraction_rate=5.0, final_residual=1e-4, tolerance=0.1,
+                                       transverse_target_rate=500.0)
+    assert conditions["transverse_contraction"] == "VIOLATED"
+    assert conditions["overall_status"] == "VIOLATED"
 
 
 def test_basic_mode_ims_analysis_is_fast_and_skips_monte_carlo():

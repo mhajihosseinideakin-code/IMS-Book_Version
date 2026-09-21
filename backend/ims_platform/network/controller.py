@@ -346,6 +346,134 @@ def current_loop_mrc_duty(topology: str, i_L: float, v_bus: float, sigma: float,
     raise ValueError(f"current_loop_mrc_duty: unsupported topology code {p.get('topology_code')!r}")
 
 
+def bus_voltage_mrc_duty(topology: str, i_L: float, v_bus: float, sigma: float, p: Dict,
+                         other_bus_injection) -> float:
+    """
+    Closed-form duty command for the SECOND-CANDIDATE, bus-voltage-
+    anchored target manifold (mrc_designer.auto_manifold's response to
+    "attempt manifold reshaping" when the first, current-anchored,
+    candidate has unstable reduced/tangential dynamics -- e.g. every CPL
+    case, proven structurally unstable for the i_L-anchored family):
+
+        v_Sigma = v_nom - R_v*i_L + K_i*sigma           (droop + integral)
+        phi2(x) = v_bus - v_Sigma = v_bus - v_nom + R_v*i_L - K_i*sigma
+        sigma_dot = v_nom - v_bus                        (same integrator)
+
+    structurally parallel to the book's own stabilizing-MRC e_Sigma
+    construction (v_Sigma = v_nom - R_v*i_l + K_i*sigma, e_Sigma = v_o -
+    v_Sigma), reinterpreted with v_o -> v_bus because these single-stage
+    Network Builder topologies have no separate free voltage state.
+
+    Unlike `current_loop_mrc_duty` above, phi2's derivative depends on
+    dv_bus/dt = (port_current(d, i_L) + i_other(v_bus)) / C, i.e. on the
+    OTHER current injected into the bus by every component besides the
+    actuated converter itself (other loads, sources) -- information this
+    controller does not otherwise have access to (Controller.control_signal
+    only ever sees this converter's own v_bus/electrical_x/controller_x).
+    `other_bus_injection` supplies it: a plain callable v_bus -> float,
+    built once at attach time from the REAL `BusComponent.current_injection`
+    method(s) of whatever else sits on the bus (see
+    `auto_manifold.attach_bus_voltage_mrc` and
+    `auto_manifold._other_bus_injection_fn`) -- never a hardcoded
+    per-load-type formula. It is an ordinary Python callable stored as an
+    attribute on the controller instance, not a `params` entry, because
+    `params` is the float-only dict this platform round-trips through
+    JSON (see TOPOLOGY_CODE's note above) -- a callable has no business
+    being coerced through that path.
+
+    Because phi2_dot is AFFINE in d for all three topologies (both
+    port_current(d,i_L) and di_L/dt(d,i_L,v_bus) are affine in d -- the
+    same structural fact `current_loop_mrc_duty` relies on for phi1), the
+    exact same "evaluate the d-independent part at d=0, divide by
+    A(x)=d(phi2_dot)/dd" construction used there applies here too; A(x)
+    is now derived from f(x),G(x) INDEPENDENTLY per topology (not copied
+    from phi1's A, which was v_in/L, v_bus/L, (v_in+v_bus)/L for
+    buck/boost/buckboost respectively -- phi2's A is a genuinely
+    different, R_v-dependent expression per topology; see
+    mrc_designer.auto_manifold.derive_symbolic_law_v2 for the independent
+    per-topology SymPy derivation this runtime formula is checked
+    against).
+    """
+    v_nom = float(p["v_nom"]); K_i = float(p["K_i"]); k_m = float(p["k_m"])
+    R_v = float(p["R_v"]); C = float(p["C"])
+    v_in = float(p["v_in"]); L = float(p["L"]); R_L = float(p["R_L"])
+    topo = TOPOLOGY_CODE_INV.get(float(p["topology_code"]))
+
+    phi2 = v_bus - v_nom + R_v * i_L - K_i * sigma
+    i_other = float(other_bus_injection(v_bus))
+    dsigma_dt = v_nom - v_bus  # no d-dependence
+
+    if topo == "buck":
+        # port_current = i_L (no d-dependence at all); di_L/dt|_{d=0} = (-v_bus - R_L*i_L)/L
+        A = R_v * v_in / L
+        if abs(A) < 1e-12:
+            raise ValueError("bus-voltage-anchored MRC duty law is singular for buck topology: R_v*v_in/L == 0")
+        port_at_0 = i_L
+        diL_at_0 = (-v_bus - R_L * i_L) / L
+    elif topo == "boost":
+        # port_current = (1-d)*i_L -> at d=0: i_L; di_L/dt|_{d=0} = (v_in - v_bus - R_L*i_L)/L
+        A = R_v * v_bus / L - i_L / C
+        if abs(A) < 1e-12:
+            raise ValueError("bus-voltage-anchored MRC duty law is singular for boost topology: A(x) == 0")
+        port_at_0 = i_L
+        diL_at_0 = (v_in - v_bus - R_L * i_L) / L
+    elif topo == "buckboost":
+        # port_current = (1-d)*i_L -> at d=0: i_L; di_L/dt|_{d=0} = (-v_bus - R_L*i_L)/L
+        A = R_v * (v_bus + v_in) / L - i_L / C
+        if abs(A) < 1e-12:
+            raise ValueError("bus-voltage-anchored MRC duty law is singular for buck-boost topology: A(x) == 0")
+        port_at_0 = i_L
+        diL_at_0 = (-v_bus - R_L * i_L) / L
+    else:
+        raise ValueError(f"bus_voltage_mrc_duty: unsupported topology code {p.get('topology_code')!r}")
+
+    dvbus_at_0 = (port_at_0 + i_other) / C
+    phi2_dot_at_d0 = dvbus_at_0 + R_v * diL_at_0 - K_i * dsigma_dt
+    d = (-k_m * phi2 - phi2_dot_at_d0) / A
+    return d
+
+
+class BusVoltageAnchoredMRCController(Controller):
+    """
+    Runtime `Controller` adapter for the bus-voltage-anchored,
+    second-candidate MRC law (`bus_voltage_mrc_duty` above) --
+    structurally parallel to `AutoCurrentLoopMRCController`, but for the
+    manifold phi2(x) = v_bus - v_nom + R_v*i_L - K_i*sigma instead of
+    phi1(x) = i_L - i_bias - K_i*sigma.
+
+        d(sigma)/dt = v_nom - v_bus                    (same integrator as phi1)
+        d = bus_voltage_mrc_duty(topology, i_L, v_bus, sigma, p, other_bus_injection)
+
+    `other_bus_injection` is set post-construction (never through
+    `param_names`/`params`, which are float-only) by
+    `auto_manifold.attach_bus_voltage_mrc`.
+    """
+
+    state_names = ("sigma",)
+    param_names = ("v_nom", "K_i", "k_m", "R_v", "topology_code", "v_in", "L", "R_L", "C")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.other_bus_injection = None  # set by attach_bus_voltage_mrc before use
+
+    def control_signal(self, v_bus, electrical_x, controller_x, u, p) -> float:
+        if self.other_bus_injection is None:
+            raise RuntimeError(
+                "BusVoltageAnchoredMRCController.other_bus_injection was never set -- this controller "
+                "must be attached via auto_manifold.attach_bus_voltage_mrc, not constructed directly."
+            )
+        i_L = float(electrical_x[0])
+        sigma = float(controller_x[0])
+        return bus_voltage_mrc_duty("", i_L, v_bus, sigma, p, self.other_bus_injection)
+
+    def local_dynamics(self, v_bus, electrical_x, controller_x, u, p) -> np.ndarray:
+        v_nom = p["v_nom"] if u is None else u
+        return np.array([v_nom - v_bus])
+
+    def initial_state_guess(self) -> np.ndarray:
+        return np.array([0.0])
+
+
 class AutoCurrentLoopMRCController(Controller):
     """
     Runtime `Controller` adapter for the automatically-derived current-
