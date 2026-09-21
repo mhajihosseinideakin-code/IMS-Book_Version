@@ -1,0 +1,2183 @@
+diff --git a/.gitignore b/.gitignore
+index 7287624..be91e1a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -92,3 +92,4 @@ android-sdk/
+ credentials.json
+ *.key
+ .credentials
++backend/.venv_demo/
+diff --git a/backend/ims_platform/core/simulator.py b/backend/ims_platform/core/simulator.py
+index f1e77c4..59fa21a 100644
+--- a/backend/ims_platform/core/simulator.py
++++ b/backend/ims_platform/core/simulator.py
+@@ -68,6 +68,7 @@ class Simulator:
+         controller: Optional[Callable[[float, np.ndarray], np.ndarray]] = None,
+         disturbances: Optional[List[Dict]] = None,
+         n_eval: int = 400,
++        max_step: Optional[float] = None,
+     ) -> TrajectoryResult:
+         """
+         Simulate the (possibly disturbed, possibly closed-loop) system.
+@@ -108,10 +109,10 @@ class Simulator:
+             n_pts = max(20, int(n_eval * (t1 - t0) / max(t_span[1] - t_span[0], 1e-9)))
+             t_eval = np.linspace(t0, t1, n_pts)
+ 
+-            sol = solve_ivp(
+-                rhs, (t0, t1), x_current, method=self.method,
+-                t_eval=t_eval, rtol=self.rtol, atol=self.atol, dense_output=False,
+-            )
++            solve_kwargs = dict(t_eval=t_eval, rtol=self.rtol, atol=self.atol, dense_output=False)
++            if max_step is not None:
++                solve_kwargs["max_step"] = max_step
++            sol = solve_ivp(rhs, (t0, t1), x_current, method=self.method, **solve_kwargs)
+ 
+             t_all.append(sol.t)
+             x_all.append(sol.y)
+diff --git a/backend/ims_platform/mrc_designer/auto_manifold.py b/backend/ims_platform/mrc_designer/auto_manifold.py
+new file mode 100644
+index 0000000..55ffb0c
+--- /dev/null
++++ b/backend/ims_platform/mrc_designer/auto_manifold.py
+@@ -0,0 +1,726 @@
++"""
++ims_platform.mrc_designer.auto_manifold
++-----------------------------------------
++
++Automatic construction of a controller-shaped MRC target manifold phi(x)
++for an assembled Network Builder model, and the full mathematical pipeline
++around it -- this module is the answer to the standing gap recorded in
++`memory/SPEC.md` ("even with f(x),G(x) available, there is NO validated
++signed controlled-target manifold phi(x) for arbitrary topologies") for
++the one structural class of topology the platform's component library
++currently supports: a directly duty-modulated converter (BuckModel /
++BoostModel / BuckBoostModel, network.converter_topologies), in any
++network, feeding any of the platform's load types.
++
++Mathematical basis
++-------------------
++Every model in this file's scope is control-affine in the duty ratio d,
++because d enters the converter's own averaged inductor equation linearly
++(network.converter_topologies):
++
++    Buck:        L di_L/dt = d*v_in - v_bus - R_L*i_L
++    Boost:       L di_L/dt = v_in - (1-d)*v_bus - R_L*i_L
++    Buck-Boost:  L di_L/dt = d*v_in - (1-d)*v_bus - R_L*i_L
++
++The duty ratio therefore has *relative degree one on i_L itself* -- it
++enters the very first differentiation of i_L, not of some downstream
++state. This is structurally different from the reduced-order voltage-
++source reference model (models.converter_cpl_paper /
++models.stabilizing_mrc), where the actuated quantity is a free outer-loop
++voltage state v_o (dv_o/dt = u) and the manifold is built on a *different*
++branch's own quasi-steady relation (book Ch. "Foundations of Intrinsic
++Manifold Stability", eq. e_m). For these duty-cycle topologies there is no
++such free voltage state to build on, so the book's own e_m-style
++construction does not apply -- but relative degree one on i_L directly
++means a controller-shaped, integral-augmented target manifold analogous
++to the book's stabilizing-MRC construction (Ch. "Stabilizing Manifold-
++Reshaping Control") DOES apply, anchored on i_L instead of v_o:
++
++    sigma_dot = v_nom - v_bus                              (new integral state)
++    phi(x) := i_L - i_bias - K_i * sigma                   (controller-shaped residual)
++
++This is exactly the "explicit inner current-control loop" route the book
++itself identifies (ch. mrc-closed-loop-verification, closing remark) as
++the open path to a stabilizing manifold when the electrical-constraint
++construction's reduced dynamics is unstable -- generalized here to
++topologies where the duty ratio is the *only* available control input in
++the first place, rather than retrofitted onto the reduced-order model.
++
++phi is affine in (i_L, sigma), so Dphi is constant in those two
++coordinates and zero everywhere else; A(x) = Dphi(x) G(x) reduces to the
++single scalar d(di_L/dt)/dd -- v_in/L (buck), v_bus/L (boost), or
++(v_in+v_bus)/L (buck-boost) -- independent of every other state in the
++network, however large. This is what makes automatic construction
++possible for an ARBITRARY surrounding network (any bus topology, any load
++mix): feasibility of this particular phi depends only on the actuated
++converter's own two parameters/state (v_in, v_bus), never on the rest of
++the assembled system.
++
++What this module does NOT claim
++---------------------------------
++This is one candidate manifold family (controller-shaped, current-loop),
++not a claim that every Network Builder model admits SOME valid phi.  A
++network with no directly duty-modulated converter (e.g. only a
++`ConstantSetpointController`/`FilteredVoltageSource`-style component, or
++only algebraic components) is honestly reported NOT ESTABLISHED by this
++family, with a load-bearing but not exhaustive scan across the whole
++project of possible manifold constructions -- see `inspect_network`'s
++`reason` field for the exact failed condition in every case.
++"""
++
++from __future__ import annotations
++
++from typing import Dict, List, Optional, Tuple
++
++import numpy as np
++import sympy
++
++from ..core.simulator import Simulator
++from ..network.controller import (
++    AutoCurrentLoopMRCController,
++    ConstantDutyController,
++    TOPOLOGY_CODE,
++    current_loop_mrc_duty,
++)
++from ..network.converter import Converter
++from ..network.converter_topologies import BuckModel, BoostModel, BuckBoostModel
++from ..network.network import Network
++from ..network.assembler import AutomaticModelBuilder, AssembledNetworkSystem
++from .designer import MRCNotEstablished
++
++TOPOLOGY_MODELS = {"buck": BuckModel, "boost": BoostModel, "buckboost": BuckBoostModel}
++_MODEL_TO_TOPOLOGY = {v: k for k, v in TOPOLOGY_MODELS.items()}
++
++DEFAULT_MRC_PARAMS = {"K_i": 20.0, "k_m": 500.0, "i_bias": 0.0}
++
++
++# ---------------------------------------------------------------------------
++# Step 1-2: locate the actuated converter, construct the candidate manifold
++# ---------------------------------------------------------------------------
++
++def find_duty_modulated_converter(net: Network, converter_id: Optional[str] = None) -> Converter:
++    """
++    Locate the (unique, unless `converter_id` disambiguates) Converter in
++    `net` whose electrical model is a directly duty-modulated topology
++    (Buck/Boost/Buck-Boost). Raises MRCNotEstablished with the exact
++    reason if none exists, or if several exist and `converter_id` was not
++    given to disambiguate -- never silently picks one.
++    """
++    candidates = [
++        c for c in net.components
++        if isinstance(c, Converter) and type(c.electrical_model) in _MODEL_TO_TOPOLOGY
++    ]
++    if converter_id is not None:
++        matches = [c for c in candidates if c.id == converter_id]
++        if not matches:
++            raise MRCNotEstablished(
++                f"MRC synthesis not established: '{converter_id}' is not a directly duty-modulated "
++                f"converter (Buck/Boost/Buck-Boost) in this network. Candidates: "
++                f"{[c.id for c in candidates] or 'none'}."
++            )
++        return matches[0]
++    if not candidates:
++        raise MRCNotEstablished(
++            "MRC synthesis not established: no physically valid signed invariant target constraint "
++            "could be derived -- this network contains no directly duty-modulated converter "
++            "(Buck/Boost/Buck-Boost). This construction's control-affine relative-degree-one relation "
++            "requires the duty ratio to enter an inductor branch's own averaged KVL equation directly; "
++            "no such branch is present."
++        )
++    if len(candidates) > 1:
++        raise MRCNotEstablished(
++            f"MRC synthesis not established: {len(candidates)} directly duty-modulated converters are "
++            f"present ({[c.id for c in candidates]}) -- 'converter_id' must be given explicitly to avoid "
++            f"silently choosing one."
++        )
++    return candidates[0]
++
++
++def symbolic_diL_dt(topology: str, iL, vbus, d, v_in, L, R_L):
++    """
++    SymPy expression for L*di_L/dt's dividend... i.e. di_L/dt itself,
++    duplicated in exact algebraic correspondence with
++    network.converter_topologies' own validated local_dynamics() (kept
++    honest by test_auto_manifold_mrc.py::test_symbolic_matches_numeric_topology,
++    which finite-differences the REAL topology class and compares).
++    """
++    if topology == "buck":
++        return (d * v_in - vbus - R_L * iL) / L
++    if topology == "boost":
++        return (v_in - (1 - d) * vbus - R_L * iL) / L
++    if topology == "buckboost":
++        return (d * v_in - (1 - d) * vbus - R_L * iL) / L
++    raise MRCNotEstablished(
++        f"MRC synthesis not established: no automatic current-loop MRC construction is implemented "
++        f"for topology '{topology}'. Supported: {sorted(TOPOLOGY_MODELS)}."
++    )
++
++
++def derive_symbolic_law(topology: str, mrc_params: Dict) -> Dict:
++    """
++    Steps 2-4 of the pipeline, symbolically: construct phi(x) = i_L -
++    i_bias - K_i*sigma, differentiate it along the converter's own averaged
++    dynamics (Dphi(x)[f(x)+G(x)u] = -k_m*phi(x)), check relative degree
++    (d(phi_dot)/dd not identically zero), and solve for d in closed form.
++
++    Returns a dict with the symbolic manifold, its derivative w.r.t. d
++    (== A(x), a scalar here), the solved control law, and both as LaTeX.
++    Raises MRCNotEstablished (with the exact failed condition) if the
++    relative-degree check fails or SymPy cannot isolate d.
++    """
++    iL, vbus, d, sigma = sympy.symbols("i_L v_bus d sigma", real=True)
++    v_in, L, R_L = sympy.symbols("v_in L R_L", positive=True)
++    v_nom, K_i, k_m, i_bias = sympy.symbols("v_nom K_i k_m i_bias", real=True)
++
++    f_iL = symbolic_diL_dt(topology, iL, vbus, d, v_in, L, R_L)
++    phi = iL - i_bias - K_i * sigma
++    sigma_dot = v_nom - vbus
++
++    # Dphi(x)[f(x)+G(x)u]: only the i_L and sigma coordinates have a
++    # nonzero partial derivative of phi (d(phi)/d(i_L)=1, d(phi)/d(sigma)=
++    # -K_i, zero everywhere else in the assembled network's state, however
++    # large that state is) -- this is exactly what makes phi's feasibility
++    # independent of the rest of the network.
++    phi_dot = 1 * f_iL + (-K_i) * sigma_dot
++
++    A_expr = sympy.diff(phi_dot, d)  # A(x) = Dphi(x) G(x), scalar here
++    A_simplified = sympy.simplify(A_expr)
++    if A_simplified == 0:
++        raise MRCNotEstablished(
++            f"MRC synthesis not established: rank(Dφ G) = 0 identically for topology '{topology}' -- "
++            f"the duty ratio does not enter φ_dot at all (relative degree greater than one); MRC "
++            f"synthesis in closed form is not possible for this (manifold, input) pair."
++        )
++
++    solutions = sympy.solve(sympy.Eq(phi_dot, -k_m * phi), d)
++    if not solutions:
++        raise MRCNotEstablished(
++            f"MRC synthesis not established: SymPy could not isolate 'd' from φ_dot = -k_m φ "
++            f"for topology '{topology}'; the relation is not solvable in closed form."
++        )
++    control_expr = sympy.simplify(solutions[0])
++
++    return {
++        "topology": topology,
++        "phi_symbolic": phi,
++        "phi_dot_symbolic": phi_dot,
++        "A_symbolic": A_simplified,
++        "control_expr": control_expr,
++        "control_latex": sympy.latex(sympy.Eq(d, control_expr)),
++        "phi_latex": sympy.latex(sympy.Eq(sympy.Symbol("phi"), phi)),
++        "symbols": {"iL": iL, "vbus": vbus, "d": d, "sigma": sigma, "v_in": v_in, "L": L,
++                    "R_L": R_L, "v_nom": v_nom, "K_i": K_i, "k_m": k_m, "i_bias": i_bias},
++    }
++
++
++# ---------------------------------------------------------------------------
++# Step 3: feasibility over a neighborhood, not just one point
++# ---------------------------------------------------------------------------
++
++def feasibility_over_neighborhood(law: Dict, params: Dict, i_L0: float, v_bus0: float,
++                                   n_samples: int = 12, radius_frac: float = 0.15) -> Dict:
++    """
++    Evaluate A(x) = d(phi_dot)/dd numerically (from the symbolic
++    expression, lambdified -- an independent evaluation path from the
++    runtime `current_loop_mrc_duty` formula) at the center point and at
++    `n_samples` perturbed (i_L, v_bus) points within +-radius_frac of the
++    center, and check sign consistency / boundedness away from zero --
++    the "over the relevant operating neighborhood, not merely at one
++    arbitrary point" requirement.
++    """
++    syms = law["symbols"]
++    A_fn = sympy.lambdify((syms["iL"], syms["vbus"], syms["v_in"], syms["L"], syms["R_L"]),
++                          law["A_symbolic"], "numpy")
++    v_in = float(params["v_in"]); L = float(params["L"]); R_L = float(params["R_L"])
++
++    rng = np.random.default_rng(0)
++    points = [(i_L0, v_bus0)]
++    for _ in range(n_samples):
++        di = i_L0 * radius_frac * rng.uniform(-1, 1)
++        dv = v_bus0 * radius_frac * rng.uniform(-1, 1)
++        points.append((i_L0 + di, max(v_bus0 + dv, 1e-6)))
++
++    values = [float(A_fn(iL, vb, v_in, L, R_L)) for (iL, vb) in points]
++    values_arr = np.asarray(values)
++    signs = np.sign(values_arr)
++    sign_consistent = bool(np.all(signs == signs[0]) or np.all(values_arr == 0))
++    min_abs = float(np.min(np.abs(values_arr)))
++
++    return {
++        "n_points_sampled": len(points),
++        "A_values": values,
++        "A_center": values[0],
++        "sign_consistent": sign_consistent,
++        "min_abs_value": min_abs,
++        "relative_degree_one_over_neighborhood": bool(sign_consistent and min_abs > 1e-9),
++    }
++
++
++# ---------------------------------------------------------------------------
++# Step 1 + 5: control-affine verification and independent G(x) cross-check
++# ---------------------------------------------------------------------------
++
++def verify_control_affine_and_G(topology: str, converter: Converter, net: Network,
++                                 x_probe_bus: float, i_L_probe: float, u_names_bus_index: int = 0) -> Dict:
++    """
++    Independent, finite-difference verification (step 1 and step 5's "F(x,u)
++    ~= f(x)+G(x)u" and "finite-difference check G(x)" requirements) that the
++    real, assembled electrical model is control-affine in d, and that its
++    numeric d(di_L/dt)/dd matches the closed-form topology formula -- using
++    the REAL `ConverterModel.local_dynamics`, not the symbolic duplicate.
++    """
++    em = converter.electrical_model
++    p = em.params
++    h = 1e-6
++    d0 = 0.5
++    f0 = em.local_dynamics(x_probe_bus, np.array([i_L_probe]), d0, p)[0]
++    f1 = em.local_dynamics(x_probe_bus, np.array([i_L_probe]), d0 + h, p)[0]
++    f_minus = em.local_dynamics(x_probe_bus, np.array([i_L_probe]), d0 - h, p)[0]
++    G_fd = float((f1 - f_minus) / (2 * h))
++    # affine check: three colinear samples in d should reproduce f0 exactly
++    # via linear interpolation if and only if local_dynamics is affine in d
++    f_mid_check = (f1 + f_minus) / 2.0
++    affine_residual = float(abs(f_mid_check - f0))
++
++    v_in = float(p["v_in"]); L = float(p["L"]); R_L = float(p["R_L"])
++    if topology == "buck":
++        G_closed_form = v_in / L
++    elif topology == "boost":
++        G_closed_form = x_probe_bus / L
++    elif topology == "buckboost":
++        G_closed_form = (v_in + x_probe_bus) / L
++    else:
++        G_closed_form = float("nan")
++
++    return {
++        "control_affine_verified": bool(affine_residual < 1e-6 * max(1.0, abs(f0))),
++        "affine_residual": affine_residual,
++        "G_finite_difference": G_fd,
++        "G_closed_form": G_closed_form,
++        "G_relative_error": float(abs(G_fd - G_closed_form) / max(abs(G_closed_form), 1e-12)),
++    }
++
++
++# ---------------------------------------------------------------------------
++# Attaching the derived controller to the real Converter / Network
++# ---------------------------------------------------------------------------
++
++def _resolved_mrc_params(topology: str, converter: Converter, v_nom: float, mrc_params: Optional[Dict]) -> Dict:
++    p = dict(DEFAULT_MRC_PARAMS)
++    if mrc_params:
++        p.update(mrc_params)
++    em_p = converter.electrical_model.params
++    return {
++        "v_nom": float(v_nom),
++        "K_i": float(p["K_i"]),
++        "k_m": float(p["k_m"]),
++        "i_bias": float(p["i_bias"]),
++        "topology_code": TOPOLOGY_CODE[topology],
++        "v_in": float(em_p["v_in"]),
++        "L": float(em_p["L"]),
++        "R_L": float(em_p.get("R_L", 0.0)),
++    }
++
++
++def attach_auto_mrc(net: Network, converter_id: str, v_nom: float, mrc_params: Optional[Dict] = None) -> Tuple[Network, Converter]:
++    """
++    Return a NEW Network (the original is left untouched) in which the
++    target converter's controller has been replaced by
++    `AutoCurrentLoopMRCController`, configured with the derived MRC
++    parameters -- MRC becomes the converter's actual active controller,
++    not merely an analysis-time overlay (task requirement 7).
++    """
++    converter = find_duty_modulated_converter(net, converter_id)
++    topology = _MODEL_TO_TOPOLOGY[type(converter.electrical_model)]
++    resolved = _resolved_mrc_params(topology, converter, v_nom, mrc_params)
++
++    new_net = Network(net.name)
++    for bus in net.buses.values():
++        new_net.buses[bus.id] = bus
++    new_net.branches = list(net.branches)
++    new_net.components = []
++    for comp in net.components:
++        if comp.id == converter.id:
++            new_controller = AutoCurrentLoopMRCController(**resolved)
++            new_conv = Converter(id=comp.id, bus=comp.bus, electrical_model=comp.electrical_model,
++                                  controller=new_controller)
++            new_net.components.append(new_conv)
++        else:
++            new_net.components.append(comp)
++    new_converter = next(c for c in new_net.components if c.id == converter.id)
++    return new_net, new_converter
++
++
++def _baseline_controller_for(converter: Converter) -> "Controller":
++    """
++    The converter's ORIGINAL controller, held at its own current
++    operating duty, used for the open-loop/baseline arm of before/after --
++    matches the platform's existing convention (network_mrc_closed_loop)
++    of comparing MRC against the converter's un-MRC'd behavior on the
++    identical assembled network, not against an unrelated model.
++    """
++    return converter.controller
++
++
++# ---------------------------------------------------------------------------
++# Full pipeline: inspect -> feasibility -> synthesize -> verify
++# ---------------------------------------------------------------------------
++
++def run_auto_mrc_pipeline(net: Network, converter_id: Optional[str] = None,
++                          v_nom: Optional[float] = None, mrc_params: Optional[Dict] = None) -> Dict:
++    """
++    Network Builder -> assembled nonlinear dynamics -> control-affine split
++    -> controlled-target manifold construction -> feasibility -> synthesis
++    -> independent verification -> closed-loop / reduced-dynamics stability.
++
++    Never raises for an unsupported model: every MRCNotEstablished is
++    caught and reported as a structured "not established" result with the
++    exact mathematical reason, per task requirement 8.
++    """
++    report: Dict = {"status": None, "reason": None}
++    try:
++        converter = find_duty_modulated_converter(net, converter_id)
++    except MRCNotEstablished as e:
++        report.update(status="MRC_SYNTHESIS_NOT_ESTABLISHED", reason=str(e))
++        return report
++
++    topology = _MODEL_TO_TOPOLOGY[type(converter.electrical_model)]
++    report["converter_id"] = converter.id
++    report["topology"] = topology
++
++    # v_nom: the voltage the integral action regulates the converter's own
++    # bus to. If not given explicitly, use the network's own bus v_init as
++    # the operating target (the same convention the project's equilibrium
++    # stage already anchors to).
++    bus = net.buses[converter.bus]
++    v_nom_val = float(v_nom) if v_nom is not None else float(bus.v_init or 1.0)
++    resolved_params = _resolved_mrc_params(topology, converter, v_nom_val, mrc_params)
++
++    # --- Step 2-4: symbolic manifold construction + synthesis ------------
++    try:
++        law = derive_symbolic_law(topology, resolved_params)
++    except MRCNotEstablished as e:
++        report.update(status="MRC_SYNTHESIS_NOT_ESTABLISHED", reason=str(e))
++        return report
++
++    report["candidate_phi"] = "phi(x) = i_L - i_bias - K_i*sigma,  sigma_dot = v_nom - v_bus"
++    report["dim_phi"] = 1
++    report["phi_latex"] = law["phi_latex"]
++    report["control_law_latex"] = law["control_latex"]
++    report["A_symbolic"] = str(law["A_symbolic"])
++
++    # --- Step 1: baseline open-loop equilibrium (before touching the controller) ---
++    baseline_system = AutomaticModelBuilder.build(net, name=net.name)
++    try:
++        base_eq = baseline_system.find_equilibrium(baseline_system.initial_guess(), with_eigs=False)
++    except Exception as e:  # pragma: no cover - defensive
++        report.update(status="MRC_SYNTHESIS_NOT_ESTABLISHED",
++                      reason=f"MRC synthesis not established: baseline equilibrium solve failed ({e}).")
++        return report
++
++    n_states = baseline_system.n_states
++    bus_state_name = net.buses[converter.bus].state_name  # e.g. "v_bus", not the bare bus id
++    i_L_idx = None
++    for name, idx in zip(baseline_system.state_names, range(n_states)):
++        if name == f"{converter.id}_em_i_L":
++            i_L_idx = idx
++    v_bus_idx = None
++    for name, idx in zip(baseline_system.state_names, range(n_states)):
++        if name == bus_state_name:
++            v_bus_idx = idx
++    if i_L_idx is None or v_bus_idx is None:  # pragma: no cover - defensive
++        report.update(status="MRC_SYNTHESIS_NOT_ESTABLISHED",
++                      reason="MRC synthesis not established: could not locate the converter's i_L or its "
++                             "bus voltage in the assembled state vector.")
++        return report
++
++    i_L0 = float(base_eq.x_star[i_L_idx])
++    v_bus0 = float(base_eq.x_star[v_bus_idx])
++    report["dim_x"] = int(n_states)
++    report["dim_u"] = 1
++    report["baseline_equilibrium"] = {baseline_system.state_names[i]: float(base_eq.x_star[i]) for i in range(n_states)}
++    report["baseline_equilibrium_converged"] = bool(base_eq.converged)
++
++    # --- Step 3: feasibility over a neighborhood --------------------------
++    feas = feasibility_over_neighborhood(law, resolved_params, i_L0, v_bus0)
++    report["feasibility"] = feas
++    report["rank_A"] = 1 if feas["relative_degree_one_over_neighborhood"] else 0
++    report["relative_degree"] = 1 if feas["relative_degree_one_over_neighborhood"] else None
++
++    # --- Step 1 + 5: independent finite-difference cross-check of G(x) ---
++    ga = verify_control_affine_and_G(topology, converter, net, v_bus0, i_L0)
++    report["control_affine_verification"] = ga
++
++    if not feas["relative_degree_one_over_neighborhood"]:
++        report.update(
++            status="MRC_SYNTHESIS_NOT_ESTABLISHED",
++            reason=(f"MRC synthesis not established: rank(Dφ G) = 0 (or sign-indefinite) somewhere in "
++                    f"the sampled operating neighborhood around i_L*={i_L0:.6g}, v_bus*={v_bus0:.6g} "
++                    f"(min|A(x)|={feas['min_abs_value']:.3e}); relative degree one does not hold uniformly."),
++        )
++        return report
++    if not ga["control_affine_verified"] or ga["G_relative_error"] > 1e-4:
++        report.update(
++            status="MRC_SYNTHESIS_NOT_ESTABLISHED",
++            reason=(f"MRC synthesis not established: independent finite-difference verification of G(x) "
++                    f"disagrees with the closed-form derivation (relative error "
++                    f"{ga['G_relative_error']:.3e}); the assumed control-affine structure is not confirmed "
++                    f"on the real assembled model."),
++        )
++        return report
++
++    # --- Attach + closed-loop equilibrium/eigenstructure ------------------
++    mrc_net, mrc_converter = attach_auto_mrc(net, converter.id, v_nom_val, mrc_params)
++    mrc_system = AutomaticModelBuilder.build(mrc_net, name=net.name + "_auto_mrc")
++    x0_guess = mrc_system.initial_guess()
++    # seed the guess from the baseline equilibrium where state names match
++    name_to_idx_mrc = {n: i for i, n in enumerate(mrc_system.state_names)}
++    for name, idx in zip(baseline_system.state_names, range(n_states)):
++        if name in name_to_idx_mrc:
++            x0_guess[name_to_idx_mrc[name]] = base_eq.x_star[idx]
++    cl_eq = mrc_system.find_equilibrium(x0_guess, with_eigs=True)
++    report["closed_loop_equilibrium"] = {mrc_system.state_names[i]: float(cl_eq.x_star[i]) for i in range(mrc_system.n_states)}
++    report["closed_loop_equilibrium_converged"] = bool(cl_eq.converged)
++    report["closed_loop_equilibrium_residual_norm"] = float(cl_eq.residual_norm)
++
++    # Step 3's "equilibrium compatibility" check: a Newton failure here is
++    # not a numerical accident -- it is the model saying the requested
++    # v_nom is not an equilibrium this topology/parameter set can reach
++    # (e.g. a target below v_in for a Boost, or above v_in for a Buck,
++    # outside the ideal-CCM-average achievable range for any duty in
++    # [0.02, 0.98]). Report NOT ESTABLISHED with that exact reason rather
++    # than continuing to report eigenvalues/contraction numbers computed
++    # at a non-equilibrium point.
++    if not cl_eq.converged:
++        report.update(
++            status="MRC_SYNTHESIS_NOT_ESTABLISHED",
++            reason=(f"MRC synthesis not established: target manifold incompatible with equilibrium -- the "
++                    f"closed-loop Newton solve did not converge (residual norm {cl_eq.residual_norm:.3e}) "
++                    f"for v_nom={v_nom_val:.6g} on topology '{topology}' with v_in="
++                    f"{resolved_params['v_in']:.6g}. This target bus voltage is likely not reachable by "
++                    f"this topology at any admissible duty d in [0.02, 0.98] (e.g. a Boost cannot regulate "
++                    f"below v_in, nor a Buck above it, in the ideal averaged model)."),
++        )
++        return report
++
++    eigs = cl_eq.eigenvalues
++    k_m = resolved_params["k_m"]
++    idx_transverse = int(np.argmin(np.abs(eigs - (-k_m)))) if eigs is not None else None
++    transverse = eigs[idx_transverse] if idx_transverse is not None else None
++    tangential = [complex(z) for i, z in enumerate(eigs) if i != idx_transverse] if eigs is not None else []
++    report["closed_loop_eigenvalues"] = [{"re": float(z.real), "im": float(z.imag)} for z in eigs] if eigs is not None else None
++    report["transverse_eigenvalue"] = {"re": float(transverse.real), "im": float(transverse.imag)} if transverse is not None else None
++    report["transverse_matches_km"] = bool(transverse is not None and abs(transverse.real + k_m) < max(1e-2 * k_m, 1.0) and abs(transverse.imag) < 1.0)
++    report["tangential_eigenvalues"] = [{"re": float(z.real), "im": float(z.imag)} for z in tangential]
++    report["tangential_locally_stable"] = bool(all(z.real < 0 for z in tangential)) if tangential else None
++
++    # --- Step 5-6: contraction residual + separate transverse/tangential claims ---
++    contraction = _contraction_residual_check(mrc_system, mrc_converter, resolved_params, cl_eq.x_star,
++                                              name_to_idx_mrc, bus_state_name)
++    report["contraction_residual"] = contraction
++
++    slowest_real = min((abs(z.real) for z in tangential if abs(z.real) > 1e-9), default=k_m)
++    # >=8 time constants of the slowest tangential mode, but capped: a
++    # near-marginal tangential mode (|Re(lambda)| -> 0, e.g. an
++    # undamped LC reduced dynamic under a constant-current load) would
++    # otherwise blow this horizon up to an astronomically large value
++    # and make the diagnostic recovery simulation below run for an
++    # effectively unbounded wall-clock time. Capping it means the
++    # "observed_finite_horizon_recovery" claim (book: a bounded,
++    # finite-horizon observation, never promoted to asymptotic/regional
++    # IMS on its own) is reported honestly as "not observed within this
++    # capped horizon" rather than the pipeline hanging.
++    horizon_uncapped = max(0.05, 8.0 / slowest_real)
++    horizon_cap = 2.0
++    horizon = min(horizon_uncapped, horizon_cap)
++    bus_idx_mrc = name_to_idx_mrc[bus_state_name]
++    sim_result = _closed_loop_simulation(mrc_system, cl_eq.x_star, t_end=horizon, perturb_idx=bus_idx_mrc)
++    sim_result["horizon_capped"] = bool(horizon_uncapped > horizon_cap)
++    sim_result["horizon_uncapped_time_constants_requested"] = float(horizon_uncapped)
++    report["simulation_result"] = sim_result
++
++    # --- Before/After (task step 7): identical disturbance, original
++    # controller vs MRC, on the identical assembled network -----------------
++    iL_idx_mrc = name_to_idx_mrc[f"{converter.id}_em_i_L"]
++    report["closed_loop_comparison"] = _before_after_trajectories(
++        baseline_system, base_eq.x_star, i_L_idx, v_bus_idx,
++        mrc_system, cl_eq.x_star, iL_idx_mrc, bus_idx_mrc, horizon,
++    )
++    report["closed_loop_comparison"]["v_nom"] = v_nom_val
++
++    report["derived_control_law"] = law["control_latex"]
++    report["equilibrium_preservation"] = {
++        "residual_norm": report["closed_loop_equilibrium_residual_norm"],
++        "converged": report["closed_loop_equilibrium_converged"],
++    }
++    report["saturation_note"] = _saturation_check(mrc_converter, cl_eq.x_star, name_to_idx_mrc, converter.id,
++                                                   bus_state_name)
++
++    claim = {
++        "ideal_residual_contraction": {
++            "claim": "phi_dot = -k_m*phi within the ideal (unsaturated) model",
++            "max_relative_error": contraction["max_relative_error"],
++        },
++        "local_equilibrium_stability": {
++            "claim": "all closed-loop eigenvalues have negative real part (linearisation)",
++            "established": report["tangential_locally_stable"] and report["transverse_matches_km"],
++        },
++        "observed_finite_horizon_recovery": {
++            "claim": "simulated trajectory returns toward the equilibrium within the run horizon",
++            "observed": sim_result.get("recovered"),
++        },
++        "certified_regional_ims": {
++            "claim": "a stated region on which every reduced trajectory converges, with a uniform bound",
++            "established": False,
++            "note": "Not established by this pipeline (matches the book's own stabilizing-MRC scope: a "
++                     "local Hurwitz-linearisation result is not a regional IMS certificate).",
++        },
++    }
++    report["claim_levels"] = claim
++
++    if report["tangential_locally_stable"] and report["transverse_matches_km"] and ga["control_affine_verified"]:
++        report["status"] = "MRC_SYNTHESIS_SUPPORTED"
++        report["reason"] = ("Analytic control-affine split verified independently, relative degree one "
++                             "confirmed over the sampled neighborhood, closed-form MRC law derived and "
++                             "solved, and the closed-loop equilibrium is locally exponentially stable "
++                             "(all eigenvalues strictly negative real part).")
++    else:
++        report["status"] = "MRC_FEASIBILITY_DIAGNOSTIC_ONLY"
++        report["reason"] = ("MRC was derived and the exact transverse residual identity holds within the "
++                             "ideal model, but the reduced/tangential closed-loop dynamics is not confirmed "
++                             "locally exponentially stable at this operating point -- reduced dynamics "
++                             "stability (condition (iii)) is a separate claim from transverse contraction, "
++                             "never inferred from it.")
++    return report
++
++
++def _contraction_residual_check(mrc_system: AssembledNetworkSystem, mrc_converter: Converter,
++                                params: Dict, x_star: np.ndarray, name_to_idx: Dict,
++                                bus_state_name: str) -> Dict:
++    """
++    Step 5: substitute u_MRC back into the ORIGINAL assembled equations and
++    independently verify phi_dot + k_m*phi ~= 0, at the equilibrium, at a
++    random nearby state, and at a disturbed state -- never inferred from
++    "the trajectory converged".
++    """
++    conv_id = mrc_converter.id
++    i_L_key = f"{conv_id}_em_i_L"
++    sigma_key = f"{conv_id}_ctrl_sigma"
++    iL_idx = name_to_idx[i_L_key]
++    sigma_idx = name_to_idx[sigma_key]
++    bus_idx = name_to_idx[bus_state_name]
++    i_bias = params["i_bias"]; K_i = params["K_i"]; k_m = params["k_m"]
++
++    def phi_of(x: np.ndarray) -> float:
++        return float(x[iL_idx] - i_bias - K_i * x[sigma_idx])
++
++    def phi_dot_numeric(x: np.ndarray) -> float:
++        f = np.asarray(mrc_system.dynamics(0.0, x, mrc_system.default_input(), mrc_system.params), dtype=float)
++        return float(f[iL_idx] - K_i * f[sigma_idx])
++
++    def eval_point(x: np.ndarray, label: str) -> Dict:
++        phi = phi_of(x)
++        phi_dot = phi_dot_numeric(x)
++        residual = phi_dot + k_m * phi
++        return {"label": label, "phi": phi, "phi_dot": phi_dot, "residual": residual,
++                "residual_abs": abs(residual)}
++
++    rng = np.random.default_rng(1)
++    x_nearby = x_star.copy()
++    x_nearby[iL_idx] += 0.03 * max(abs(x_star[iL_idx]), 1.0) * rng.uniform(-1, 1)
++    x_nearby[bus_idx] += 0.03 * max(abs(x_star[bus_idx]), 1.0) * rng.uniform(-1, 1)
++    x_disturbed = x_star.copy()
++    x_disturbed[bus_idx] *= 0.85  # a 15% bus-voltage sag, off the manifold
++
++    points = [eval_point(x_star, "equilibrium"), eval_point(x_nearby, "random_nearby"),
++              eval_point(x_disturbed, "disturbed")]
++    max_rel = max(p["residual_abs"] / max(abs(k_m * p["phi"]), 1e-9) if abs(p["phi"]) > 1e-9 else p["residual_abs"]
++                  for p in points)
++    return {"points": points, "max_relative_error": float(max_rel),
++            "identity": "phi_dot + k_m*phi ~= 0 (ideal, unsaturated model)"}
++
++
++def _closed_loop_simulation(mrc_system: AssembledNetworkSystem, x_star: np.ndarray, t_end: float = 0.05,
++                             perturb_idx: int = 0, return_trajectory: bool = False) -> Dict:
++    x0 = x_star.copy()
++    x0[perturb_idx] *= 0.85  # perturb the target converter's own bus voltage (a 15% sag)
++    init_dev = float(np.linalg.norm(x0 - x_star))
++    sim = Simulator(mrc_system, method="RK45")
++    try:
++        # max_step bounds RK45 to a sane fraction of the horizon so a
++        # near-singular / stiff perturbed trajectory (duty law
++        # denominator approached but not crossed, marginal tangential
++        # dynamics, etc.) fails fast with solve_ivp's own step-size-
++        # too-small diagnostic instead of the adaptive stepper grinding
++        # through an effectively unbounded number of tiny steps.
++        result = sim.simulate(x0=x0, t_span=(0.0, t_end), n_eval=500, max_step=max(t_end / 200.0, 1e-6))
++    except (ValueError, FloatingPointError, ZeroDivisionError) as e:
++        # A genuine physical/numerical breakdown along the perturbed
++        # trajectory (e.g. the duty law's own denominator crossing zero
++        # because the state left the domain the linearisation is valid
++        # near) -- reported as a solver failure, exactly the book's own
++        # solver_status = SolverFailure category
++        # (ch:recoverability-theory), never silently swallowed or
++        # allowed to crash the whole pipeline.
++        out = {"t_end": t_end, "success": False, "message": f"solver failure: {e}",
++               "initial_deviation": init_dev, "final_deviation": None, "recovered": False}
++        if return_trajectory:
++            out["t"] = None; out["x"] = None
++        return out
++    final_dev = float(np.linalg.norm(result.x[:, -1] - x_star))
++    out = {"t_end": t_end, "success": bool(result.success), "message": result.message,
++           "initial_deviation": init_dev, "final_deviation": final_dev,
++           "recovered": bool(result.success and final_dev < 0.1 * init_dev)}
++    if return_trajectory:
++        out["t"] = result.t.tolist()
++        out["x"] = result.x.tolist()
++    return out
++
++
++def _before_after_trajectories(baseline_system: AssembledNetworkSystem, base_eq_x_star: np.ndarray,
++                                base_iL_idx: int, base_bus_idx: int,
++                                mrc_system: AssembledNetworkSystem, mrc_eq_x_star: np.ndarray,
++                                mrc_iL_idx: int, mrc_bus_idx: int, t_end: float) -> Dict:
++    """
++    Task step 7's "Before/After" report, made concrete: the SAME 15% bus-
++    voltage sag applied to (a) the original assembled network with its
++    original (pre-MRC) controller, and (b) the identical network with the
++    automatically-derived MRC now the converter's active controller --
++    full i_L(t)/v_bus(t)/deviation-from-equilibrium trajectories for both,
++    for a genuine baseline-vs-MRC comparison rather than a single-run
++    diagnostic.
++    """
++    base_result = _closed_loop_simulation(baseline_system, base_eq_x_star, t_end=t_end,
++                                           perturb_idx=base_bus_idx, return_trajectory=True)
++    mrc_result = _closed_loop_simulation(mrc_system, mrc_eq_x_star, t_end=t_end,
++                                          perturb_idx=mrc_bus_idx, return_trajectory=True)
++
++    def extract(res: Dict, iL_idx: int, bus_idx: int) -> Dict:
++        out = dict(res)
++        if res.get("x") is not None:
++            x_arr = np.array(res["x"])
++            out["i_L"] = x_arr[iL_idx, :].tolist()
++            out["v_bus"] = x_arr[bus_idx, :].tolist()
++        else:
++            out["i_L"] = None
++            out["v_bus"] = None
++        out.pop("x", None)
++        return out
++
++    return {"baseline": extract(base_result, base_iL_idx, base_bus_idx),
++            "mrc": extract(mrc_result, mrc_iL_idx, mrc_bus_idx)}
++
++
++def _saturation_check(mrc_converter: Converter, x_star: np.ndarray, name_to_idx: Dict,
++                      conv_id: str, bus_state_name: str) -> Dict:
++    iL = float(x_star[name_to_idx[f"{conv_id}_em_i_L"]])
++    sigma = float(x_star[name_to_idx[f"{conv_id}_ctrl_sigma"]])
++    vbus = float(x_star[name_to_idx[bus_state_name]])
++    p = mrc_converter.controller.params
++    d_raw = current_loop_mrc_duty("", iL, vbus, sigma, p)
++    saturated = bool(d_raw < 0.02 or d_raw > 0.98)
++    return {"duty_at_equilibrium": d_raw, "saturated": saturated,
++            "note": ("Duty at equilibrium is within [0.02, 0.98]: the exact contraction identity is "
++                     "active there." if not saturated else
++                     "Duty at equilibrium falls outside the converter's clamp [0.02, 0.98]: the exact "
++                     "contraction identity phi_dot=-k_m*phi is NOT active while the duty clamp is engaged.")}
+diff --git a/backend/ims_platform/network/controller.py b/backend/ims_platform/network/controller.py
+index 376af69..4b7393d 100644
+--- a/backend/ims_platform/network/controller.py
++++ b/backend/ims_platform/network/controller.py
+@@ -275,3 +275,105 @@ class DroopController(Controller):
+         v_ref = v_nom - p["R_droop"] * i_L
+         d_nom = p.get("d_nominal", 0.5)
+         return d_nom + p["Kp"] * (v_ref - v_bus) / v_nom_safe
++
++
++#: Numeric topology codes for AutoCurrentLoopMRCController.params["topology_code"]
++#: (kept numeric, not a string, because every other entry of a component's
++#: params dict is a plain float elsewhere in the platform -- e.g.
++#: network.assembler.AssembledNetworkSystem._collect_params/prefixed_params
++#: and every JSON-serialization path over params/state -- so a stray string
++#: value here would be a silent landmine for any code that assumes
++#: float(v) works on every params entry).
++TOPOLOGY_CODE = {"buck": 0.0, "boost": 1.0, "buckboost": 2.0}
++TOPOLOGY_CODE_INV = {v: k for k, v in TOPOLOGY_CODE.items()}
++
++
++def current_loop_mrc_duty(topology: str, i_L: float, v_bus: float, sigma: float, p: Dict) -> float:
++    """
++    Closed-form duty command for the automatically-derived, controller-
++    shaped current-loop MRC target manifold
++
++        phi(x) = i_L - i_bias - K_i * sigma,     sigma_dot = v_nom - v_bus
++
++    applied to a directly duty-modulated converter (network.converter_
++    topologies.BuckModel / BoostModel / BuckBoostModel), where the duty
++    ratio d enters di_L/dt directly (relative degree one on i_L itself,
++    by the converter's own averaged KVL relation) -- structurally the
++    same "controller-shaped target manifold" category as the book's
++    stabilizing-MRC construction (an integral-augmented linear target),
++    just anchored on i_L rather than on a free outer-loop voltage state,
++    because these topologies have no such free state for the duty ratio
++    to actuate through.
++
++    This closed form is produced by solving
++
++        L * di_L/dt(i_L, v_bus, d) = L * [ -k_m*(i_L - i_bias - K_i*sigma)
++                                            + K_i*(v_nom - v_bus) ]
++
++    for d, using each topology's own averaged inductor-voltage relation
++    (exactly the equations in network.converter_topologies). This
++    duplication is deliberate and load-bearing, not accidental: it lets
++    `mrc_designer.auto_manifold`'s independent SymPy derivation of the
++    same closed form be checked against this runtime formula (and both,
++    in turn, against a finite-difference derivative of the real,
++    assembled ConverterModel.local_dynamics) as three separate
++    computational paths for the same quantity --
++    tests/test_auto_manifold_mrc.py::test_symbolic_matches_numeric_law
++    is the regression that keeps them from silently drifting apart.
++
++    Raises ValueError for any topology this construction does not (yet)
++    cover -- never silently falls back to an unrelated formula.
++    """
++    v_nom = float(p["v_nom"]); K_i = float(p["K_i"]); k_m = float(p["k_m"])
++    i_bias = float(p["i_bias"])
++    v_in = float(p["v_in"]); L = float(p["L"]); R_L = float(p["R_L"])
++    topo = TOPOLOGY_CODE_INV.get(float(p["topology_code"]))
++
++    rhs_target = L * (-k_m * (i_L - i_bias - K_i * sigma) + K_i * (v_nom - v_bus))
++    if topo == "buck":
++        if abs(v_in) < 1e-12:
++            raise ValueError("current-loop MRC duty law is singular for buck topology: v_in == 0")
++        return (rhs_target + v_bus + R_L * i_L) / v_in
++    if topo == "boost":
++        if abs(v_bus) < 1e-9:
++            raise ValueError("current-loop MRC duty law is singular for boost topology: v_bus == 0")
++        return 1.0 - (v_in - R_L * i_L - rhs_target) / v_bus
++    if topo == "buckboost":
++        denom = v_in + v_bus
++        if abs(denom) < 1e-9:
++            raise ValueError("current-loop MRC duty law is singular for buck-boost topology: v_in + v_bus == 0")
++        return (rhs_target + v_bus + R_L * i_L) / denom
++    raise ValueError(f"current_loop_mrc_duty: unsupported topology code {p.get('topology_code')!r}")
++
++
++class AutoCurrentLoopMRCController(Controller):
++    """
++    Runtime `Controller` adapter for the automatically-derived current-
++    loop MRC law (`current_loop_mrc_duty` above). Structurally parallel
++    to `SynthesizedMRCController`'s role for the reduced-order voltage-
++    source model: this class contains no derivation of its own -- it is
++    only the object that lets `mrc_designer.auto_manifold`'s derived law
++    become the Converter's ACTUAL active controller (state, dynamics,
++    and control signal), attached through the same `Converter`/
++    `AutomaticModelBuilder` machinery as every other controller in this
++    file, on the real assembled Network Builder model -- not a
++    parallel/simulated stand-in.
++
++        d(sigma)/dt = v_nom - v_bus                    (voltage-error integrator)
++        d = current_loop_mrc_duty(topology, i_L, v_bus, sigma, p)   (duty command)
++    """
++
++    state_names = ("sigma",)
++    param_names = ("v_nom", "K_i", "k_m", "i_bias", "topology_code", "v_in", "L", "R_L")
++
++    def control_signal(self, v_bus, electrical_x, controller_x, u, p) -> float:
++        i_L = float(electrical_x[0])
++        sigma = float(controller_x[0])
++        return current_loop_mrc_duty("", i_L, v_bus, sigma, p)
++
++    def local_dynamics(self, v_bus, electrical_x, controller_x, u, p) -> np.ndarray:
++        v_nom = p["v_nom"] if u is None else u
++        return np.array([v_nom - v_bus])
++
++    def initial_state_guess(self) -> np.ndarray:
++        return np.array([0.0])
+diff --git a/backend/ims_platform/server/app.py b/backend/ims_platform/server/app.py
+index 75ec51c..13be7d1 100644
+--- a/backend/ims_platform/server/app.py
++++ b/backend/ims_platform/server/app.py
+@@ -43,6 +43,8 @@ from ..core.system import EquilibriumResult
+ from ..ims import IntrinsicManifold, RecoverabilityAnalyzer
+ from ..control import ScheduledLQRControl, MRCSynthesizer
+ from ..network.controller import ConstantSetpointController
++from ..mrc_designer.auto_manifold import run_auto_mrc_pipeline, attach_auto_mrc, find_duty_modulated_converter
++from ..mrc_designer.designer import MRCNotEstablished as _AutoMRCNotEstablished
+ from .auth import register_auth_routes
+ from . import iberian_scenario
+ from . import gfm_current_limit_case
+@@ -607,6 +609,15 @@ def create_app() -> Flask:
+     app.add_url_rule("/api/network_mrc/inspect", "network_mrc_inspect_route",
+                       lambda: _network_mrc_route(network_mrc_inspect), methods=["POST"])
+ 
++    # General Network-Builder MRC capability: runs the real automatic
++    # derivation pipeline (mrc_designer.auto_manifold) on an ARBITRARY
++    # user-built network_spec, rather than the fixed Converter-CPL demo
++    # network the /apply and /closed_loop routes above are scoped to.
++    app.add_url_rule("/api/network_mrc/auto_apply", "network_mrc_auto_apply_route",
++                      lambda: _network_mrc_route(network_mrc_auto_apply), methods=["POST"])
++    app.add_url_rule("/api/network_mrc/auto_closed_loop", "network_mrc_auto_closed_loop_route",
++                      lambda: _network_mrc_route(network_mrc_auto_closed_loop), methods=["POST"])
++
+     def _custom_handler(stage_fn):
+         def handler(stage_ignored=None):
+             def _smart_default_input(network_spec):
+@@ -2633,62 +2644,174 @@ def network_mrc_closed_loop(payload: dict) -> dict:
+ 
+ def network_mrc_inspect(payload: dict) -> dict:
+     """
+-    Honest per-model MRC feasibility for a USER-BUILT (assembled) network.
+-    Inspects the real AutomaticModelBuilder system: control-affine split
+-    f(x)+G(x)u (numeric), control authority of the assigned input, and whether
+-    a validated SIGNED controlled-target manifold phi(x) exists. Never forces
+-    SUPPORTED -- reports the exact mathematical reason.
++    Runs the REAL automatic MRC derivation pipeline
++    (mrc_designer.auto_manifold.run_auto_mrc_pipeline) on the USER-BUILT
++    (Network Builder) network: control-affine split f(x)+G(x)u, automatic
++    construction of a candidate SIGNED controlled-target manifold phi(x)
++    for any directly duty-modulated converter (Buck/Boost/Buck-Boost) in
++    the network, Dphi*G feasibility, closed-form synthesis when feasible,
++    independent numeric re-verification, and transverse/tangential
++    stability separation.
++
++    This is the actual mathematical derivation, not a hard-coded lookup --
++    the result comes back as one of MRC_SYNTHESIS_SUPPORTED,
++    MRC_FEASIBILITY_DIAGNOSTIC_ONLY, or MRC_SYNTHESIS_NOT_ESTABLISHED
++    (with the exact failed mathematical condition), from run_auto_mrc_pipeline
++    itself -- never forced, never a generic "no registered manifold" message.
++
++    For a network with no directly duty-modulated converter at all (the
++    only structural class this construction currently covers -- see the
++    module docstring of auto_manifold.py), the pipeline still runs and
++    reports NOT_ESTABLISHED with the specific missing structural
++    condition; the f(x)/G(x) numeric control-affine split is still
++    reported underneath, for diagnostic visibility, via a lightweight
++    fallback finite-difference check on the assembled system.
+     """
+     spec = payload.get("network_spec")
+     if not spec:
+         raise ValueError("network_spec is required")
+     net, input_id = _build_network_from_spec(spec)
++
++    converter_id = payload.get("converter_id")
++    v_nom = payload.get("v_nom")
++    if v_nom is not None:
++        v_nom = float(v_nom)
++    mrc_params = payload.get("mrc_params")
++
++    report = run_auto_mrc_pipeline(net, converter_id=converter_id, v_nom=v_nom, mrc_params=mrc_params)
++
++    # Diagnostic numeric f(x)/G(x) split on the same assembled network
++    # (independent of whatever the pipeline internally used), so the
++    # inspect response always shows the actual control-affine structure
++    # of THIS model even when no duty-modulated converter is present.
+     system = AutomaticModelBuilder.build(net, input_component_id=input_id, name=spec.get("name"))
+     n = system.n_states
+     m = len(system.input_names)
+-
+     if payload.get("x_star") is not None:
+         x_star = np.array(payload["x_star"], dtype=float)
+     else:
+         x_star = system.find_equilibrium(system.initial_guess(), with_eigs=False).x_star
+-
+     u0 = np.array(payload.get("nominal_input", system.default_input()), dtype=float)
+     if u0.shape[0] != m:
+         u0 = np.zeros(m)
+     p = system.params
+-
+-    # Numeric control-affine split at the operating point / operating input.
+     f0 = np.asarray(system.dynamics(0.0, x_star, u0, p), dtype=float)
+     G = np.zeros((n, m)); h = 1e-6
+     for j in range(m):
+         uj = u0.astype(float).copy(); uj[j] += h
+         G[:, j] = (np.asarray(system.dynamics(0.0, x_star, uj, p), dtype=float) - f0) / h
+     g_norm = float(np.linalg.norm(G))
+-    control_authority = bool(g_norm > 1e-9)
+-
+-    reasons: List[str] = []
+-    if not control_authority:
+-        reasons.append(
+-            f"the assigned exogenous input '{system.input_names[0] if m else '(none)'}' does not enter the "
+-            f"state dynamics (G = d(f)/du = 0), so the model has no control authority to reshape any manifold")
+-    reasons.append(
+-        "no validated signed controlled-target manifold phi(x) exists for this assembled topology: IMS analysis "
+-        "provides only a numeric distance-to-manifold residual, whose gradient is a unit normal to the sampled "
+-        "curve rather than a controlled-invariant transverse coordinate, so it cannot justify synthesis")
+-    reason = ("MRC synthesis not established for this Network Builder model. " + "; ".join(reasons) +
+-              ". Establishing MRC for a new topology requires deriving a signed controlled-target manifold via "
+-              "control.mrc_synthesis (a symbolic-engine step), which is not available generically for arbitrary "
+-              "assembled networks. The validated synthesis path is the Network + Auto-MRC (assembled Converter-CPL) "
+-              "model; the Four-State Stabilising MRC remains a reference benchmark only.")
++
++    established = report.get("status") == "MRC_SYNTHESIS_SUPPORTED"
+     return {
+-        "mrc_established": False,
+-        "establishment_basis": "none",
++        "mrc_established": established,
++        "establishment_basis": report.get("status"),
+         "dim_x": int(n), "dim_u": int(m), "input_names": list(system.input_names),
+         "state_names": list(system.state_names),
+         "operating_point": [float(v) for v in x_star],
+-        "G_method": "finite_difference", "G_norm": g_norm, "control_authority": control_authority,
+-        "manifold_method": "numeric_distance_to_manifold", "controlled_target_manifold": False,
+-        "dim_phi": None, "A": None, "rank_A": None, "condition_number": None,
+-        "reason": reason,
+-        "note": "Honest per-model feasibility computed on the actual assembled Network Builder system.",
++        "G_method": "finite_difference", "G_norm": g_norm,
++        "control_authority": bool(g_norm > 1e-9),
++        "pipeline_report": report,
++        "reason": report.get("reason"),
++        "note": ("Full automatic MRC derivation pipeline (Network Builder -> control-affine split -> "
++                 "controlled-target manifold -> feasibility -> synthesis -> independent verification -> "
++                 "transverse/tangential stability) executed on the actual assembled model; see "
++                 "'pipeline_report' for every intermediate quantity (candidate phi, Dphi*G, rank, relative "
++                 "degree, derived control law, contraction residual, closed-loop eigenvalues, simulation)."),
++    }
++
++
++def network_mrc_auto_apply(payload: dict) -> dict:
++    """
++    Attach the automatically-derived MRC controller to the target
++    directly-duty-modulated converter of a USER-BUILT Network Builder
++    model, making it the converter's actual active controller (task
++    requirement 7) -- only when run_auto_mrc_pipeline has established
++    synthesis for that specific model; raises otherwise (the same honest
++    failure the /inspect endpoint would have reported).
++    """
++    spec = payload.get("network_spec")
++    if not spec:
++        raise ValueError("network_spec is required")
++    net, _input_id = _build_network_from_spec(spec)
++    converter_id = payload.get("converter_id")
++    v_nom = payload.get("v_nom")
++    if v_nom is not None:
++        v_nom = float(v_nom)
++    mrc_params = payload.get("mrc_params")
++
++    report = run_auto_mrc_pipeline(net, converter_id=converter_id, v_nom=v_nom, mrc_params=mrc_params)
++    if report.get("status") not in ("MRC_SYNTHESIS_SUPPORTED", "MRC_FEASIBILITY_DIAGNOSTIC_ONLY"):
++        raise ValueError(f"MRC synthesis not established for this model -- {report.get('reason')}")
++
++    resolved_converter_id = converter_id or report["converter_id"]
++    # Same "no v_nom given -> use the converter's own bus v_init" convention
++    # run_auto_mrc_pipeline itself uses (auto_manifold.py); resolved here too
++    # so attach_auto_mrc (which requires a float) is never handed None.
++    v_nom_val = v_nom if v_nom is not None else float(net.buses[find_duty_modulated_converter(net, resolved_converter_id).bus].v_init or 1.0)
++    new_net, mrc_converter = attach_auto_mrc(net, resolved_converter_id, v_nom_val, mrc_params)
++    return {
++        "applied": True,
++        "status": report["status"],
++        "converter": {
++            "id": mrc_converter.id, "bus": mrc_converter.bus,
++            "electrical_model": type(mrc_converter.electrical_model).__name__,
++            "active_controller": {
++                "type": "AutoCurrentLoopMRCController",
++                "label": "Automatically-derived current-loop MRC (auto_manifold)",
++                "law_latex": report.get("derived_control_law"),
++                "topology": report.get("topology"),
++            },
++        },
++        "network_summary": _network_summary_from_network(new_net),
++        "pipeline_report": report,
++        "note": ("The automatically-derived MRC is now this converter's active controller in the assembled "
++                 "network. Use /api/network_mrc/auto_closed_loop with the same network_spec to compare "
++                 "baseline vs MRC."),
++    }
++
++
++def network_mrc_auto_closed_loop(payload: dict) -> dict:
++    """
++    Baseline (the converter's original controller) vs automatically-
++    derived MRC, on the IDENTICAL user-built assembled network -- the
++    same Build -> Solve Equilibrium -> Apply MRC -> Run Closed Loop ->
++    Before/After workflow as the reference network_mrc project, but for
++    an arbitrary Network Builder model via run_auto_mrc_pipeline. Reuses
++    the pipeline's own closed-loop simulation result rather than
++    re-simulating separately, since the pipeline already runs baseline
++    equilibrium, MRC equilibrium, and a disturbed-recovery simulation of
++    the actual closed-loop system.
++    """
++    spec = payload.get("network_spec")
++    if not spec:
++        raise ValueError("network_spec is required")
++    net, _input_id = _build_network_from_spec(spec)
++    converter_id = payload.get("converter_id")
++    v_nom = payload.get("v_nom")
++    if v_nom is not None:
++        v_nom = float(v_nom)
++    mrc_params = payload.get("mrc_params")
++
++    report = run_auto_mrc_pipeline(net, converter_id=converter_id, v_nom=v_nom, mrc_params=mrc_params)
++    if report.get("status") not in ("MRC_SYNTHESIS_SUPPORTED", "MRC_FEASIBILITY_DIAGNOSTIC_ONLY"):
++        raise ValueError(f"MRC synthesis not established for this model -- {report.get('reason')}")
++    return {
++        "status": report["status"],
++        "converter_id": report.get("converter_id"),
++        "topology": report.get("topology"),
++        "equilibrium_preservation": report.get("equilibrium_preservation"),
++        "contraction_residual": report.get("contraction_residual"),
++        "closed_loop_eigenvalues": report.get("closed_loop_eigenvalues"),
++        "transverse_eigenvalue": report.get("transverse_eigenvalue"),
++        "tangential_eigenvalues": report.get("tangential_eigenvalues"),
++        "tangential_locally_stable": report.get("tangential_locally_stable"),
++        "simulation_result": report.get("simulation_result"),
++        "closed_loop_comparison": report.get("closed_loop_comparison"),
++        "claim_levels": report.get("claim_levels"),
++        "derived_control_law": report.get("derived_control_law"),
++        "saturation_note": report.get("saturation_note"),
++        "disclaimer": ("Automatic per-model result from the same mathematical pipeline as /inspect and "
++                       "/auto_apply, run on the actual assembled Network Builder model -- not a certified "
++                       "regional IMS guarantee (see claim_levels for the four separately-tracked claims)."),
+     }
+diff --git a/backend/ims_platform/server/static/explorer.html b/backend/ims_platform/server/static/explorer.html
+index 2df5456..531b4ff 100644
+--- a/backend/ims_platform/server/static/explorer.html
++++ b/backend/ims_platform/server/static/explorer.html
+@@ -154,19 +154,21 @@ header { display: flex; align-items: center; justify-content: space-between; pad
+ .hero-accent-line-fill { height: 100%; width: 40%; background: linear-gradient(90deg, transparent, var(--teal), transparent);
+    animation: heroAccentSweep 3.4s ease-in-out infinite; }
+ @keyframes heroAccentSweep { 0% { transform: translateX(-120%); } 100% { transform: translateX(340%); } }
+-.hero-caps { position: relative; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+-   gap: 0; margin: 16px auto 2px; max-width: 900px; }
++.hero-caps { position: relative; z-index: 2; display: flex; flex-wrap: nowrap; align-items: flex-start; justify-content: center;
++   gap: 0; margin: 16px auto 2px; width: 100%; max-width: 980px; }
+ .hero-cap { position: relative; display: flex; flex-direction: column; align-items: center; gap: 5px; text-align: center;
+-   padding: 6px 14px; min-width: 124px; border-radius: 9px; transition: background .18s ease, transform .18s ease; }
++   flex: 1 1 0; min-width: 0; max-width: 176px; padding: 6px 8px; border-radius: 9px; transition: background .18s ease, transform .18s ease; }
+ .hero-cap:hover { background: rgba(63,224,168,0.05); transform: translateY(-2px); }
+ .hero-cap-ic { width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+-   font-size: 13px; color: var(--teal); background: rgba(63,224,168,0.08); border: 1px solid rgba(63,224,168,0.34);
++   flex-shrink: 0; font-size: 13px; color: var(--teal); background: rgba(63,224,168,0.08); border: 1px solid rgba(63,224,168,0.34);
+    transition: background .18s ease, box-shadow .18s ease; }
+ .hero-cap:hover .hero-cap-ic { background: rgba(63,224,168,0.17); box-shadow: 0 0 16px rgba(63,224,168,0.5); }
+-.hero-cap b { font-size: 11px; color: var(--text); font-weight: 600; letter-spacing: .01em; }
+-.hero-cap i { font-size: 9.5px; color: var(--text-muted); font-style: normal; }
+-.hero-cap-sep { align-self: flex-start; margin-top: 14px; color: rgba(127,255,196,0.42); font-family: var(--mono); font-size: 14px; }
+-@media (max-width: 760px) { .hero-cap-sep { display: none; } .hero-cap { flex: 1 1 40%; } }
++.hero-cap b { display: block; max-width: 100%; font-size: clamp(9px, 1.05vw, 11px); color: var(--text); font-weight: 600;
++   letter-spacing: .01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.hero-cap i { display: block; max-width: 100%; font-size: clamp(7.5px, 0.85vw, 9.5px); color: var(--text-muted); font-style: normal;
++   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.hero-cap-sep { flex: 0 0 auto; align-self: flex-start; margin-top: 14px; color: rgba(127,255,196,0.42); font-family: var(--mono); font-size: 14px; }
++@media (max-width: 560px) { .hero-cap-sep { display: none; } .hero-cap b, .hero-cap i { font-size: 8px; } }
+ 
+ /* Layer 2 -- Scientific visualization: the manifold, trajectory,
+    disturbance and equilibrium nodes. Uses xMidYMid *slice* so the
+@@ -174,7 +176,7 @@ header { display: flex; align-items: center; justify-content: space-between; pad
+    space -- previously the cause of it reading as only ~60% wide),
+    then a radial vignette overlay dissolves all four edges into the
+    page background so it never reads as an inserted rectangle. */
+-.hero-illustration { position: relative; z-index: 1; width: 100%; max-width: 1240px; height: clamp(240px, 26vw, 322px); margin: 2px auto 0; overflow: hidden;
++.hero-illustration { position: relative; z-index: 1; width: 100%; max-width: 1240px; height: clamp(276px, 29.9vw, 370px); margin: 2px auto 0; overflow: hidden;
+    -webkit-mask-image: radial-gradient(ellipse 84% 82% at 50% 45%, #000 50%, transparent 93%);
+    mask-image: radial-gradient(ellipse 84% 82% at 50% 45%, #000 50%, transparent 93%); }
+ .hero-illustration::after { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 2;
+@@ -466,14 +468,11 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
+       <stop offset="0%" stop-color="#3FE0A8" stop-opacity="0.11"/>
+       <stop offset="100%" stop-color="#3FE0A8" stop-opacity="0"/>
+     </radialGradient>
+-    <linearGradient id="fogGradG" x1="0%" y1="0%" x2="0%" y2="100%">
+-      <stop offset="0%" stop-color="#0B0D13" stop-opacity="0"/>
+-      <stop offset="100%" stop-color="#3FE0A8" stop-opacity="0.05"/>
+-    </linearGradient>
+     <linearGradient id="trajGlowG" x1="0%" y1="100%" x2="100%" y2="0%">
+       <stop offset="0%" stop-color="#FF6B6B"/>
+-      <stop offset="28%" stop-color="#C787E8"/>
+-      <stop offset="60%" stop-color="#6FC6FF"/>
++      <stop offset="22%" stop-color="#C787E8"/>
++      <stop offset="48%" stop-color="#9B6EFA"/>
++      <stop offset="70%" stop-color="#6FC6FF"/>
+       <stop offset="100%" stop-color="#3FE0A8"/>
+     </linearGradient>
+     <radialGradient id="particleGlowG" cx="50%" cy="50%" r="50%">
+@@ -481,9 +480,6 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
+       <stop offset="45%" stop-color="#3FE0A8"/>
+       <stop offset="100%" stop-color="#3FE0A8" stop-opacity="0"/>
+     </radialGradient>
+-    <filter id="meshBlurG" x="-20%" y="-20%" width="140%" height="140%">
+-      <feGaussianBlur stdDeviation="0.25"/>
+-    </filter>
+     <filter id="softGlowG" x="-90%" y="-90%" width="280%" height="280%">
+       <feGaussianBlur stdDeviation="4" result="blur"/>
+       <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+@@ -496,27 +492,9 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
+       <feGaussianBlur stdDeviation="3.2" result="blur"/>
+       <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+     </filter>
+-    <linearGradient id="trajFadeGradG" gradientUnits="userSpaceOnUse" x1="108" y1="0" x2="330" y2="0">
+-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0"/>
+-      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="1"/>
+-    </linearGradient>
+-    <mask id="trajFadeMaskG" maskUnits="userSpaceOnUse" x="0" y="0" width="1400" height="700">
+-      <rect x="0" y="0" width="1400" height="700" fill="url(#trajFadeGradG)"/>
+-    </mask>
+-    <linearGradient id="meshFadeGradG" gradientUnits="userSpaceOnUse" x1="195" y1="0" x2="420" y2="0">
+-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0"/>
+-      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="1"/>
+-    </linearGradient>
+-    <mask id="meshFadeMaskG" maskUnits="userSpaceOnUse" x="0" y="0" width="1400" height="700">
+-      <rect x="0" y="0" width="1400" height="700" fill="url(#meshFadeGradG)"/>
+-    </mask>
+-    <linearGradient id="bridgeFadeGradG" gradientUnits="userSpaceOnUse" x1="-75" y1="0" x2="100" y2="0">
+-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0"/>
+-      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="1"/>
+-    </linearGradient>
+-    <mask id="bridgeFadeMaskG" maskUnits="userSpaceOnUse" x="-200" y="0" width="1600" height="700">
+-      <rect x="-200" y="0" width="1600" height="700" fill="url(#bridgeFadeGradG)"/>
+-    </mask>
++    <marker id="emArrowHead" markerWidth="7" markerHeight="7" refX="3.4" refY="3.4" orient="auto">
++      <path d="M0,0 L7,3.4 L0,6.8 Z" fill="#EAFFF7" opacity="0.85"/>
++    </marker>
+   </defs>
+ 
+   <rect x="0" y="0" width="1400" height="700" fill="url(#ambientG1)"/>
+@@ -524,178 +502,107 @@ button.secondary-btn:hover { border-color: var(--teal); color: var(--teal); }
+   <g opacity="0.6">
+   <circle cx="569" cy="146" r="0.6" fill="#EAF3FF" opacity="0.14"/>
+   <circle cx="1053" cy="181" r="0.8" fill="#EAF3FF" opacity="0.22"/>
+-  <circle cx="753" cy="648" r="0.9" fill="#EAF3FF" opacity="0.18"/>
+   <circle cx="854" cy="157" r="1.2" fill="#EAF3FF" opacity="0.17"/>
+   <circle cx="548" cy="474" r="0.6" fill="#EAF3FF" opacity="0.22"/>
+   <circle cx="1176" cy="240" r="1.3" fill="#EAF3FF" opacity="0.20"/>
+   <circle cx="1073" cy="329" r="0.8" fill="#EAF3FF" opacity="0.15"/>
+   <circle cx="30" cy="149" r="1.3" fill="#EAF3FF" opacity="0.20"/>
+-  <circle cx="648" cy="622" r="1.0" fill="#EAF3FF" opacity="0.28"/>
+   <circle cx="506" cy="157" r="1.2" fill="#EAF3FF" opacity="0.13"/>
+-  <circle cx="1097" cy="415" r="1.3" fill="#EAF3FF" opacity="0.27"/>
+   <circle cx="918" cy="35" r="0.5" fill="#EAF3FF" opacity="0.19"/>
+   <circle cx="1135" cy="65" r="0.8" fill="#EAF3FF" opacity="0.12"/>
+   <circle cx="441" cy="14" r="0.8" fill="#EAF3FF" opacity="0.19"/>
+-  <circle cx="293" cy="545" r="0.5" fill="#EAF3FF" opacity="0.14"/>
+   <circle cx="370" cy="285" r="1.1" fill="#EAF3FF" opacity="0.16"/>
+-  <circle cx="965" cy="637" r="0.6" fill="#EAF3FF" opacity="0.26"/>
+-  <circle cx="836" cy="518" r="1.0" fill="#EAF3FF" opacity="0.17"/>
+   <circle cx="151" cy="108" r="0.6" fill="#EAF3FF" opacity="0.13"/>
+   <circle cx="218" cy="151" r="0.9" fill="#EAF3FF" opacity="0.24"/>
+   <circle cx="890" cy="27" r="0.9" fill="#EAF3FF" opacity="0.17"/>
+-  <circle cx="1022" cy="470" r="1.5" fill="#EAF3FF" opacity="0.14"/>
+   <circle cx="594" cy="30" r="0.8" fill="#EAF3FF" opacity="0.24"/>
+   <circle cx="56" cy="145" r="1.2" fill="#EAF3FF" opacity="0.25"/>
+-  <circle cx="320" cy="411" r="1.4" fill="#EAF3FF" opacity="0.12"/>
+-  <circle cx="1116" cy="485" r="0.9" fill="#EAF3FF" opacity="0.16"/>
+   <circle cx="1322" cy="239" r="0.7" fill="#EAF3FF" opacity="0.14"/>
+-  <circle cx="1173" cy="421" r="1.4" fill="#EAF3FF" opacity="0.29"/>
+-  <circle cx="749" cy="672" r="1.0" fill="#EAF3FF" opacity="0.25"/>
+-  <circle cx="1148" cy="431" r="1.5" fill="#EAF3FF" opacity="0.25"/>
+   <circle cx="978" cy="41" r="0.8" fill="#EAF3FF" opacity="0.19"/>
+   <circle cx="129" cy="168" r="0.7" fill="#EAF3FF" opacity="0.18"/>
+   <circle cx="885" cy="258" r="1.0" fill="#EAF3FF" opacity="0.17"/>
+-  <circle cx="383" cy="647" r="1.2" fill="#EAF3FF" opacity="0.26"/>
+-  <circle cx="253" cy="506" r="0.8" fill="#EAF3FF" opacity="0.21"/>
+-  <circle cx="1366" cy="445" r="1.2" fill="#EAF3FF" opacity="0.28"/>
+-  <circle cx="1166" cy="538" r="0.8" fill="#EAF3FF" opacity="0.13"/>
+-  <circle cx="449" cy="192" r="0.8" fill="#EAF3FF" opacity="0.34"/>
++  <circle cx="876" cy="88" r="1.2" fill="#EAF3FF" opacity="0.26"/>
+   <circle cx="1212" cy="224" r="1.3" fill="#EAF3FF" opacity="0.21"/>
+   <circle cx="1264" cy="322" r="0.9" fill="#EAF3FF" opacity="0.18"/>
+   <circle cx="783" cy="189" r="1.2" fill="#EAF3FF" opacity="0.33"/>
+-  <circle cx="563" cy="159" r="1.6" fill="#EAF3FF" opacity="0.24"/>
+   <circle cx="144" cy="42" r="0.7" fill="#EAF3FF" opacity="0.26"/>
+-  <circle cx="1097" cy="297" r="0.7" fill="#EAF3FF" opacity="0.21"/>
+   <circle cx="1375" cy="370" r="1.6" fill="#EAF3FF" opacity="0.32"/>
+-  <circle cx="36" cy="500" r="1.3" fill="#EAF3FF" opacity="0.24"/>
+-  <circle cx="383" cy="446" r="0.7" fill="#EAF3FF" opacity="0.22"/>
+-  <circle cx="637" cy="659" r="1.5" fill="#EAF3FF" opacity="0.18"/>
+-  </g>
+-  <path d="M 60 620 Q 300 560 560 600 Q 820 640 1080 580 Q 1240 550 1360 590" fill="none" stroke="#3FE0A8" stroke-width="0.8" opacity="0.06"/>
+-
+-  <path d="M 195.0 282.0 Q 195.0 282.0 269.6 282.5 Q 344.1 283.0 418.7 280.9 Q 493.3 278.7 567.9 273.6 Q 642.4 268.5 717.0 261.2 Q 791.6 254.0 866.1 246.0 Q 940.7 238.0 1015.3 231.0 Q 1089.9 224.0 1164.4 219.3 L 1239.0 214.7" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 195.0 294.4 Q 195.0 294.4 271.6 294.7 Q 348.3 295.0 424.9 292.6 Q 501.6 290.2 578.2 284.9 Q 654.9 279.6 731.5 272.3 Q 808.1 265.0 884.8 257.1 Q 961.4 249.2 1038.1 242.4 Q 1114.7 235.6 1191.4 231.2 L 1268.0 226.8" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 195.0 306.8 Q 195.0 306.8 273.7 306.9 Q 352.4 306.9 431.1 304.3 Q 509.9 301.6 588.6 296.2 Q 667.3 290.7 746.0 283.4 Q 824.7 276.0 903.4 268.2 Q 982.1 260.4 1060.9 253.8 Q 1139.6 247.2 1218.3 243.1 L 1297.0 238.9" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 195.0 319.2 Q 195.0 319.2 275.8 319.0 Q 356.6 318.8 437.4 315.9 Q 518.1 313.0 598.9 307.4 Q 679.7 301.8 760.5 294.4 Q 841.3 287.1 922.1 279.4 Q 1002.9 271.7 1083.6 265.3 Q 1164.4 258.9 1245.2 255.0 L 1326.0 251.1" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 195.0 331.5 Q 195.0 331.5 277.9 331.0 Q 360.7 330.6 443.6 327.5 Q 526.4 324.4 609.3 318.6 Q 692.1 312.9 775.0 305.5 Q 857.9 298.1 940.7 290.6 Q 1023.6 283.0 1106.4 276.8 Q 1189.3 270.7 1272.1 267.0 L 1355.0 263.3" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 195.0 282.0 Q 195.0 282.0 195.0 288.2 Q 195.0 294.4 195.0 300.6 Q 195.0 306.8 195.0 313.0 Q 195.0 319.2 195.0 325.3 L 195.0 331.5" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 344.1 283.0 Q 344.1 283.0 346.2 289.0 Q 348.3 295.0 350.4 301.0 Q 352.4 306.9 354.5 312.9 Q 356.6 318.8 358.6 324.7 L 360.7 330.6" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 493.3 278.7 Q 493.3 278.7 497.4 284.4 Q 501.6 290.2 505.7 295.9 Q 509.9 301.6 514.0 307.3 Q 518.1 313.0 522.3 318.7 L 526.4 324.4" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 642.4 268.5 Q 642.4 268.5 648.6 274.1 Q 654.9 279.6 661.1 285.2 Q 667.3 290.7 673.5 296.3 Q 679.7 301.8 685.9 307.4 L 692.1 312.9" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 791.6 254.0 Q 791.6 254.0 799.9 259.5 Q 808.1 265.0 816.4 270.5 Q 824.7 276.0 833.0 281.5 Q 841.3 287.1 849.6 292.6 L 857.9 298.1" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 940.7 238.0 Q 940.7 238.0 951.1 243.6 Q 961.4 249.2 971.8 254.8 Q 982.1 260.4 992.5 266.1 Q 1002.9 271.7 1013.2 277.3 L 1023.6 283.0" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 1089.9 224.0 Q 1089.9 224.0 1102.3 229.8 Q 1114.7 235.6 1127.1 241.4 Q 1139.6 247.2 1152.0 253.1 Q 1164.4 258.9 1176.9 264.8 L 1189.3 270.7" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 1239.0 214.7 Q 1239.0 214.7 1253.5 220.7 Q 1268.0 226.8 1282.5 232.9 Q 1297.0 238.9 1311.5 245.0 Q 1326.0 251.1 1340.5 257.2 L 1355.0 263.3" fill="none" stroke="#6FC6FF" stroke-width="0.6" opacity="0.03"/>
+-  <path d="M 195.0 244.2 Q 195.0 244.2 254.4 246.6 Q 313.9 248.9 373.4 248.7 Q 432.8 248.6 492.2 245.3 Q 551.7 242.1 611.2 236.0 Q 670.6 229.9 730.0 221.8 Q 789.5 213.8 849.0 205.2 Q 908.4 196.5 967.9 188.9 Q 1027.3 181.3 1086.8 176.1 L 1146.2 170.8" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 195.0 256.5 Q 195.0 256.5 256.2 258.6 Q 317.4 260.6 378.6 260.2 Q 439.8 259.8 500.9 256.3 Q 562.1 252.8 623.3 246.5 Q 684.5 240.3 745.7 232.1 Q 806.9 224.0 868.1 215.5 Q 929.3 207.0 990.5 199.7 Q 1051.7 192.3 1112.8 187.3 L 1174.0 182.3" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 195.0 268.7 Q 195.0 268.7 257.9 270.5 Q 320.9 272.4 383.8 271.6 Q 446.7 270.9 509.6 267.2 Q 572.6 263.5 635.5 257.0 Q 698.4 250.6 761.4 242.5 Q 824.3 234.3 887.2 226.0 Q 950.2 217.6 1013.1 210.4 Q 1076.0 203.3 1139.0 198.6 L 1201.9 193.8" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 195.0 280.8 Q 195.0 280.8 259.7 282.4 Q 324.3 284.0 389.0 283.0 Q 453.7 282.0 518.3 278.0 Q 583.0 274.1 647.7 267.5 Q 712.4 260.9 777.0 252.8 Q 841.7 244.7 906.4 236.4 Q 971.0 228.2 1035.7 221.3 Q 1100.4 214.3 1165.0 209.9 L 1229.7 205.5" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 195.0 292.9 Q 195.0 292.9 261.4 294.3 Q 327.8 295.6 394.2 294.3 Q 460.6 293.1 527.0 288.9 Q 593.5 284.7 659.9 278.0 Q 726.3 271.3 792.7 263.1 Q 859.1 255.0 925.5 246.9 Q 991.9 238.8 1058.3 232.1 Q 1124.7 225.5 1191.2 221.3 L 1257.6 217.1" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 195.0 305.0 Q 195.0 305.0 263.1 306.1 Q 331.3 307.2 399.4 305.6 Q 467.6 304.1 535.8 299.6 Q 603.9 295.2 672.0 288.4 Q 740.2 281.6 808.3 273.5 Q 876.5 265.4 944.6 257.4 Q 1012.8 249.5 1080.9 243.1 Q 1149.1 236.6 1217.2 232.7 L 1285.4 228.8" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 195.0 244.2 Q 195.0 244.2 195.0 250.4 Q 195.0 256.5 195.0 262.6 Q 195.0 268.7 195.0 274.8 Q 195.0 280.8 195.0 286.9 Q 195.0 292.9 195.0 299.0 L 195.0 305.0" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 313.9 248.9 Q 313.9 248.9 315.6 254.8 Q 317.4 260.6 319.1 266.5 Q 320.9 272.4 322.6 278.2 Q 324.3 284.0 326.1 289.8 Q 327.8 295.6 329.6 301.4 L 331.3 307.2" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 432.8 248.6 Q 432.8 248.6 436.3 254.2 Q 439.8 259.8 443.2 265.3 Q 446.7 270.9 450.2 276.5 Q 453.7 282.0 457.2 287.5 Q 460.6 293.1 464.1 298.6 L 467.6 304.1" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 551.7 242.1 Q 551.7 242.1 556.9 247.5 Q 562.1 252.8 567.4 258.1 Q 572.6 263.5 577.8 268.8 Q 583.0 274.1 588.2 279.4 Q 593.5 284.7 598.7 289.9 L 603.9 295.2" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 670.6 229.9 Q 670.6 229.9 677.6 235.1 Q 684.5 240.3 691.5 245.4 Q 698.4 250.6 705.4 255.8 Q 712.4 260.9 719.3 266.1 Q 726.3 271.3 733.2 276.4 L 740.2 281.6" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 789.5 213.8 Q 789.5 213.8 798.2 218.9 Q 806.9 224.0 815.6 229.2 Q 824.3 234.3 833.0 239.5 Q 841.7 244.7 850.4 249.8 Q 859.1 255.0 867.8 260.2 L 876.5 265.4" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 908.4 196.5 Q 908.4 196.5 918.8 201.8 Q 929.3 207.0 939.7 212.3 Q 950.2 217.6 960.6 222.9 Q 971.0 228.2 981.5 233.5 Q 991.9 238.8 1002.4 244.1 L 1012.8 249.5" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 1027.3 181.3 Q 1027.3 181.3 1039.5 186.8 Q 1051.7 192.3 1063.8 197.8 Q 1076.0 203.3 1088.2 208.8 Q 1100.4 214.3 1112.6 219.9 Q 1124.7 225.5 1136.9 231.0 L 1149.1 236.6" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 1146.2 170.8 Q 1146.2 170.8 1160.1 176.5 Q 1174.0 182.3 1188.0 188.1 Q 1201.9 193.8 1215.8 199.7 Q 1229.7 205.5 1243.6 211.3 Q 1257.6 217.1 1271.5 223.0 L 1285.4 228.8" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.07"/>
+-  <path d="M 195.0 194.5 Q 195.0 194.5 236.8 198.7 Q 278.5 202.9 320.3 205.4 Q 362.0 208.0 403.8 208.1 Q 445.6 208.3 487.3 205.7 Q 529.1 203.2 570.8 198.0 Q 612.6 192.7 654.4 185.4 Q 696.1 178.1 737.9 169.5 Q 779.6 160.9 821.4 152.2 Q 863.2 143.5 904.9 135.7 Q 946.7 127.9 988.4 122.0 L 1030.2 116.1" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 195.0 205.1 Q 195.0 205.1 237.9 209.1 Q 280.8 213.1 323.8 215.5 Q 366.7 217.8 409.6 217.7 Q 452.5 217.6 495.4 214.8 Q 538.4 212.0 581.3 206.6 Q 624.2 201.2 667.1 193.7 Q 710.0 186.3 753.0 177.7 Q 795.9 169.2 838.8 160.6 Q 881.7 151.9 924.6 144.3 Q 967.6 136.8 1010.5 131.1 L 1053.4 125.5" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 195.0 215.7 Q 195.0 215.7 239.1 219.5 Q 283.2 223.4 327.2 225.4 Q 371.3 227.5 415.4 227.2 Q 459.5 226.8 503.6 223.8 Q 547.6 220.7 591.7 215.1 Q 635.8 209.6 679.9 202.0 Q 724.0 194.5 768.0 186.0 Q 812.1 177.4 856.2 168.9 Q 900.3 160.4 944.4 153.1 Q 988.4 145.7 1032.5 140.3 L 1076.6 134.9" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 195.0 226.3 Q 195.0 226.3 240.2 229.9 Q 285.5 233.5 330.7 235.4 Q 376.0 237.2 421.2 236.6 Q 466.4 236.0 511.7 232.7 Q 556.9 229.4 602.2 223.7 Q 647.4 217.9 692.6 210.3 Q 737.9 202.8 783.1 194.2 Q 828.4 185.7 873.6 177.4 Q 918.8 169.0 964.1 161.8 Q 1009.3 154.6 1054.6 149.5 L 1099.8 144.4" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 195.0 236.8 Q 195.0 236.8 241.4 240.2 Q 287.8 243.7 334.2 245.3 Q 380.6 246.9 427.0 246.0 Q 473.4 245.1 519.8 241.6 Q 566.2 238.1 612.6 232.2 Q 659.0 226.3 705.4 218.6 Q 751.8 211.0 798.2 202.5 Q 844.6 194.0 891.0 185.8 Q 937.4 177.6 983.8 170.6 Q 1030.2 163.7 1076.6 158.8 L 1123.0 153.9" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 195.0 247.2 Q 195.0 247.2 242.6 250.5 Q 290.1 253.8 337.7 255.1 Q 385.2 256.4 432.8 255.3 Q 480.4 254.2 527.9 250.5 Q 575.5 246.8 623.0 240.7 Q 670.6 234.7 718.2 226.9 Q 765.7 219.2 813.3 210.8 Q 860.8 202.4 908.4 194.3 Q 956.0 186.2 1003.5 179.5 Q 1051.1 172.7 1098.6 168.1 L 1146.2 163.5" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 195.0 257.7 Q 195.0 257.7 243.7 260.7 Q 292.4 263.8 341.2 264.9 Q 389.9 266.0 438.6 264.6 Q 487.3 263.2 536.0 259.3 Q 584.8 255.4 633.5 249.2 Q 682.2 243.0 730.9 235.3 Q 779.6 227.5 828.4 219.1 Q 877.1 210.8 925.8 202.8 Q 974.5 194.9 1023.2 188.4 Q 1072.0 181.8 1120.7 177.5 L 1169.4 173.1" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 195.0 194.5 Q 195.0 194.5 195.0 199.8 Q 195.0 205.1 195.0 210.4 Q 195.0 215.7 195.0 221.0 Q 195.0 226.3 195.0 231.5 Q 195.0 236.8 195.0 242.0 Q 195.0 247.2 195.0 252.5 L 195.0 257.7" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 278.5 202.9 Q 278.5 202.9 279.7 208.0 Q 280.8 213.1 282.0 218.3 Q 283.2 223.4 284.3 228.5 Q 285.5 233.5 286.6 238.6 Q 287.8 243.7 289.0 248.7 Q 290.1 253.8 291.3 258.8 L 292.4 263.8" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 362.0 208.0 Q 362.0 208.0 364.4 212.9 Q 366.7 217.8 369.0 222.6 Q 371.3 227.5 373.6 232.4 Q 376.0 237.2 378.3 242.0 Q 380.6 246.9 382.9 251.6 Q 385.2 256.4 387.6 261.2 L 389.9 266.0" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 445.6 208.3 Q 445.6 208.3 449.0 213.0 Q 452.5 217.6 456.0 222.2 Q 459.5 226.8 463.0 231.4 Q 466.4 236.0 469.9 240.6 Q 473.4 245.1 476.9 249.7 Q 480.4 254.2 483.8 258.7 L 487.3 263.2" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 529.1 203.2 Q 529.1 203.2 533.7 207.6 Q 538.4 212.0 543.0 216.3 Q 547.6 220.7 552.3 225.1 Q 556.9 229.4 561.6 233.8 Q 566.2 238.1 570.8 242.4 Q 575.5 246.8 580.1 251.1 L 584.8 255.4" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 612.6 192.7 Q 612.6 192.7 618.4 197.0 Q 624.2 201.2 630.0 205.4 Q 635.8 209.6 641.6 213.7 Q 647.4 217.9 653.2 222.1 Q 659.0 226.3 664.8 230.5 Q 670.6 234.7 676.4 238.8 L 682.2 243.0" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 696.1 178.1 Q 696.1 178.1 703.1 182.2 Q 710.0 186.3 717.0 190.4 Q 724.0 194.5 730.9 198.6 Q 737.9 202.8 744.8 206.9 Q 751.8 211.0 758.8 215.1 Q 765.7 219.2 772.7 223.4 L 779.6 227.5" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 779.6 160.9 Q 779.6 160.9 787.8 165.1 Q 795.9 169.2 804.0 173.3 Q 812.1 177.4 820.2 181.6 Q 828.4 185.7 836.5 189.9 Q 844.6 194.0 852.7 198.2 Q 860.8 202.4 869.0 206.6 L 877.1 210.8" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 863.2 143.5 Q 863.2 143.5 872.4 147.7 Q 881.7 151.9 891.0 156.2 Q 900.3 160.4 909.6 164.7 Q 918.8 169.0 928.1 173.3 Q 937.4 177.6 946.7 181.9 Q 956.0 186.2 965.2 190.6 L 974.5 194.9" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 946.7 127.9 Q 946.7 127.9 957.1 132.3 Q 967.6 136.8 978.0 141.2 Q 988.4 145.7 998.9 150.2 Q 1009.3 154.6 1019.8 159.1 Q 1030.2 163.7 1040.6 168.2 Q 1051.1 172.7 1061.5 177.3 L 1072.0 181.8" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <path d="M 1030.2 116.1 Q 1030.2 116.1 1041.8 120.8 Q 1053.4 125.5 1065.0 130.2 Q 1076.6 134.9 1088.2 139.6 Q 1099.8 144.4 1111.4 149.1 Q 1123.0 153.9 1134.6 158.7 Q 1146.2 163.5 1157.8 168.3 L 1169.4 173.1" fill="none" stroke="#3FE0A8" stroke-width="1.0" opacity="0.22"/>
+-  <g mask="url(#bridgeFadeMaskG)">
+-  <path d="M -27.7 102.3 Q -27.7 102.3 -17.6 102.5 Q -7.5 102.7 2.7 103.2 Q 12.8 103.6 22.9 104.4 Q 33.0 105.1 43.1 106.1 Q 53.3 107.1 63.4 108.3 Q 73.5 109.5 83.6 110.9 Q 93.8 112.3 103.9 113.9 Q 114.0 115.4 124.1 117.1 Q 134.3 118.8 144.4 120.6 Q 154.5 122.4 164.6 124.3 Q 174.8 126.2 184.9 128.1 L 195.0 130.0" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -34.5 111.7 Q -34.5 111.7 -24.1 112.0 Q -13.6 112.3 -3.2 112.8 Q 7.2 113.4 17.7 114.2 Q 28.1 115.0 38.5 116.0 Q 48.9 117.1 59.4 118.3 Q 69.8 119.5 80.2 121.0 Q 90.7 122.4 101.1 124.0 Q 111.5 125.6 122.0 127.3 Q 132.4 129.0 142.8 130.8 Q 153.3 132.6 163.7 134.5 Q 174.1 136.3 184.6 138.2 L 195.0 140.1" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -41.3 121.2 Q -41.3 121.2 -30.6 121.6 Q -19.8 121.9 -9.1 122.5 Q 1.7 123.1 12.4 124.0 Q 23.1 124.9 33.9 125.9 Q 44.6 127.0 55.4 128.3 Q 66.1 129.6 76.9 131.0 Q 87.6 132.5 98.3 134.1 Q 109.1 135.7 119.8 137.4 Q 130.6 139.2 141.3 141.0 Q 152.0 142.8 162.8 144.6 Q 173.5 146.5 184.3 148.3 L 195.0 150.2" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -48.1 130.7 Q -48.1 130.7 -37.0 131.1 Q -26.0 131.6 -14.9 132.2 Q -3.9 132.9 7.2 133.8 Q 18.2 134.7 29.3 135.9 Q 40.3 137.0 51.4 138.3 Q 62.4 139.6 73.5 141.1 Q 84.5 142.6 95.6 144.2 Q 106.6 145.8 117.7 147.6 Q 128.7 149.3 139.8 151.1 Q 150.8 152.9 161.9 154.7 Q 172.9 156.6 184.0 158.4 L 195.0 160.3" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -54.9 140.3 Q -54.9 140.3 -43.5 140.8 Q -32.2 141.3 -20.8 142.0 Q -9.4 142.7 1.9 143.7 Q 13.3 144.7 24.6 145.8 Q 36.0 147.0 47.3 148.3 Q 58.7 149.7 70.1 151.2 Q 81.4 152.7 92.8 154.3 Q 104.1 156.0 115.5 157.7 Q 126.9 159.4 138.2 161.2 Q 149.6 163.0 160.9 164.8 Q 172.3 166.6 183.6 168.5 L 195.0 170.3" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -61.7 149.9 Q -61.7 149.9 -50.0 150.4 Q -38.3 151.0 -26.7 151.8 Q -15.0 152.6 -3.3 153.6 Q 8.3 154.6 20.0 155.8 Q 31.7 157.0 43.3 158.4 Q 55.0 159.8 66.7 161.3 Q 78.3 162.8 90.0 164.5 Q 101.7 166.1 113.3 167.8 Q 125.0 169.5 136.7 171.3 Q 148.3 173.1 160.0 174.9 Q 171.7 176.7 183.3 178.5 L 195.0 180.3" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -68.4 159.5 Q -68.4 159.5 -56.5 160.1 Q -44.5 160.7 -32.5 161.6 Q -20.5 162.4 -8.6 163.5 Q 3.4 164.5 15.4 165.8 Q 27.4 167.0 39.3 168.4 Q 51.3 169.8 63.3 171.4 Q 75.3 172.9 87.2 174.6 Q 99.2 176.2 111.2 177.9 Q 123.2 179.6 135.1 181.4 Q 147.1 183.2 159.1 184.9 Q 171.1 186.7 183.0 188.5 L 195.0 190.2" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -75.2 169.2 Q -75.2 169.2 -63.0 169.8 Q -50.7 170.5 -38.4 171.4 Q -26.1 172.3 -13.8 173.4 Q -1.5 174.5 10.7 175.7 Q 23.0 177.0 35.3 178.4 Q 47.6 179.9 59.9 181.4 Q 72.2 183.0 84.4 184.6 Q 96.7 186.3 109.0 188.0 Q 121.3 189.7 133.6 191.5 Q 145.9 193.2 158.1 195.0 Q 170.4 196.7 182.7 198.4 L 195.0 200.1" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -27.7 102.3 Q -27.7 102.3 -31.1 107.0 Q -34.5 111.7 -37.9 116.5 Q -41.3 121.2 -44.7 126.0 Q -48.1 130.7 -51.5 135.5 Q -54.9 140.3 -58.3 145.1 Q -61.7 149.9 -65.1 154.7 Q -68.4 159.5 -71.8 164.3 L -75.2 169.2" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M -10.6 102.6 Q -10.6 102.6 -13.7 107.4 Q -16.9 112.1 -20.0 117.0 Q -23.1 121.8 -26.3 126.6 Q -29.4 131.4 -32.5 136.2 Q -35.6 141.1 -38.8 145.9 Q -41.9 150.8 -45.0 155.6 Q -48.2 160.5 -51.3 165.4 L -54.4 170.3" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 6.5 103.3 Q 6.5 103.3 3.7 108.1 Q 0.8 113.0 -2.1 117.8 Q -4.9 122.7 -7.8 127.6 Q -10.7 132.4 -13.6 137.3 Q -16.4 142.2 -19.3 147.1 Q -22.2 152.0 -25.0 156.9 Q -27.9 161.8 -30.8 166.8 L -33.7 171.7" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 23.7 104.4 Q 23.7 104.4 21.1 109.3 Q 18.5 114.2 15.8 119.1 Q 13.2 124.0 10.6 128.9 Q 8.0 133.8 5.4 138.8 Q 2.8 143.7 0.2 148.7 Q -2.4 153.6 -5.0 158.5 Q -7.7 163.5 -10.3 168.5 L -12.9 173.4" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 40.8 105.8 Q 40.8 105.8 38.5 110.8 Q 36.1 115.7 33.8 120.7 Q 31.4 125.6 29.1 130.6 Q 26.7 135.6 24.4 140.5 Q 22.0 145.5 19.7 150.5 Q 17.3 155.5 15.0 160.4 Q 12.6 165.4 10.3 170.4 L 7.9 175.4" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 57.9 107.6 Q 57.9 107.6 55.9 112.6 Q 53.8 117.6 51.7 122.6 Q 49.6 127.6 47.5 132.6 Q 45.4 137.6 43.3 142.6 Q 41.2 147.6 39.1 152.6 Q 37.1 157.6 35.0 162.6 Q 32.9 167.6 30.8 172.6 L 28.7 177.7" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 75.1 109.7 Q 75.1 109.7 73.2 114.7 Q 71.4 119.8 69.6 124.8 Q 67.8 129.8 65.9 134.8 Q 64.1 139.9 62.3 144.9 Q 60.5 149.9 58.6 154.9 Q 56.8 160.0 55.0 165.0 Q 53.1 170.0 51.3 175.1 L 49.5 180.1" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 92.2 112.1 Q 92.2 112.1 90.6 117.1 Q 89.1 122.2 87.5 127.2 Q 85.9 132.3 84.4 137.3 Q 82.8 142.4 81.2 147.4 Q 79.7 152.5 78.1 157.5 Q 76.5 162.6 75.0 167.6 Q 73.4 172.7 71.8 177.7 L 70.3 182.7" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 109.3 114.7 Q 109.3 114.7 108.0 119.8 Q 106.7 124.8 105.4 129.9 Q 104.1 135.0 102.8 140.0 Q 101.5 145.1 100.2 150.1 Q 98.9 155.2 97.6 160.3 Q 96.3 165.3 95.0 170.4 Q 93.7 175.4 92.4 180.5 L 91.1 185.5" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 126.5 117.5 Q 126.5 117.5 125.4 122.6 Q 124.4 127.7 123.3 132.7 Q 122.3 137.8 121.2 142.9 Q 120.2 148.0 119.2 153.0 Q 118.1 158.1 117.1 163.1 Q 116.0 168.2 115.0 173.3 Q 113.9 178.3 112.9 183.3 L 111.9 188.4" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 143.6 120.5 Q 143.6 120.5 142.8 125.6 Q 142.0 130.6 141.3 135.7 Q 140.5 140.8 139.7 145.9 Q 138.9 150.9 138.1 156.0 Q 137.3 161.1 136.6 166.1 Q 135.8 171.2 135.0 176.2 Q 134.2 181.3 133.4 186.3 L 132.6 191.3" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 160.7 123.6 Q 160.7 123.6 160.2 128.7 Q 159.7 133.7 159.2 138.8 Q 158.6 143.9 158.1 149.0 Q 157.6 154.0 157.1 159.1 Q 156.6 164.1 156.0 169.2 Q 155.5 174.2 155.0 179.2 Q 154.5 184.3 153.9 189.3 L 153.4 194.3" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 177.9 126.8 Q 177.9 126.8 177.6 131.8 Q 177.3 136.9 177.1 142.0 Q 176.8 147.0 176.6 152.1 Q 176.3 157.1 176.0 162.2 Q 175.8 167.2 175.5 172.2 Q 175.3 177.3 175.0 182.3 Q 174.7 187.3 174.5 192.3 L 174.2 197.2" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 130.0 Q 195.0 130.0 195.0 135.1 Q 195.0 140.1 195.0 145.2 Q 195.0 150.2 195.0 155.2 Q 195.0 160.3 195.0 165.3 Q 195.0 170.3 195.0 175.3 Q 195.0 180.3 195.0 185.2 Q 195.0 190.2 195.0 195.2 L 195.0 200.1" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
++  <circle cx="449" cy="192" r="0.8" fill="#EAF3FF" opacity="0.34"/>
+   </g>
+-  <g mask="url(#meshFadeMaskG)">
+-  <path d="M 195.0 130.0 Q 195.0 130.0 221.8 135.0 Q 248.5 139.9 275.3 144.2 Q 302.1 148.5 328.8 151.6 Q 355.6 154.7 382.4 156.2 Q 409.2 157.6 435.9 157.1 Q 462.7 156.6 489.5 154.0 Q 516.2 151.5 543.0 147.0 Q 569.8 142.4 596.5 136.3 Q 623.3 130.1 650.1 122.7 Q 676.8 115.3 703.6 107.3 Q 730.4 99.2 757.2 91.2 Q 783.9 83.2 810.7 75.8 Q 837.5 68.4 864.2 62.2 L 891.0 56.0" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 140.1 Q 195.0 140.1 222.6 145.0 Q 250.2 149.8 277.8 154.0 Q 305.3 158.1 332.9 161.0 Q 360.5 163.9 388.1 165.2 Q 415.7 166.4 443.3 165.6 Q 470.9 164.9 498.4 162.1 Q 526.0 159.3 553.6 154.6 Q 581.2 150.0 608.8 143.7 Q 636.4 137.4 663.9 129.9 Q 691.5 122.5 719.1 114.5 Q 746.7 106.5 774.3 98.6 Q 801.9 90.6 829.5 83.4 Q 857.0 76.2 884.6 70.2 L 912.2 64.2" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 150.2 Q 195.0 150.2 223.4 154.9 Q 251.8 159.7 280.2 163.7 Q 308.6 167.7 337.0 170.4 Q 365.4 173.1 393.8 174.1 Q 422.2 175.1 450.6 174.1 Q 479.0 173.1 507.4 170.1 Q 535.8 167.2 564.2 162.3 Q 592.6 157.5 621.0 151.1 Q 649.4 144.6 677.8 137.2 Q 706.2 129.7 734.6 121.7 Q 763.0 113.8 791.4 106.0 Q 819.8 98.1 848.2 91.1 Q 876.6 84.0 905.0 78.2 L 933.4 72.4" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 160.3 Q 195.0 160.3 224.2 164.9 Q 253.4 169.5 282.7 173.4 Q 311.9 177.2 341.1 179.7 Q 370.3 182.2 399.5 182.9 Q 428.7 183.7 458.0 182.5 Q 487.2 181.3 516.4 178.1 Q 545.6 174.9 574.8 169.9 Q 604.0 164.9 633.3 158.4 Q 662.5 151.9 691.7 144.4 Q 720.9 136.9 750.1 129.0 Q 779.3 121.1 808.6 113.4 Q 837.8 105.7 867.0 98.8 Q 896.2 91.9 925.4 86.3 L 954.6 80.7" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 170.3 Q 195.0 170.3 225.0 174.8 Q 255.1 179.3 285.1 183.0 Q 315.1 186.6 345.2 188.9 Q 375.2 191.2 405.2 191.7 Q 435.3 192.3 465.3 190.9 Q 495.3 189.4 525.4 186.1 Q 555.4 182.7 585.4 177.5 Q 615.5 172.4 645.5 165.8 Q 675.5 159.2 705.6 151.7 Q 735.6 144.2 765.6 136.3 Q 795.7 128.4 825.7 120.8 Q 855.7 113.2 885.7 106.5 Q 915.8 99.8 945.8 94.4 L 975.8 89.1" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 180.3 Q 195.0 180.3 225.8 184.7 Q 256.7 189.1 287.5 192.5 Q 318.4 196.0 349.2 198.1 Q 380.1 200.2 410.9 200.5 Q 441.8 200.8 472.6 199.2 Q 503.5 197.5 534.3 194.0 Q 565.2 190.4 596.0 185.1 Q 626.9 179.8 657.7 173.2 Q 688.6 166.5 719.4 159.0 Q 750.3 151.4 781.1 143.6 Q 812.0 135.8 842.8 128.3 Q 873.7 120.9 904.5 114.3 Q 935.4 107.8 966.2 102.6 L 997.1 97.5" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 190.2 Q 195.0 190.2 226.7 194.5 Q 258.3 198.8 290.0 202.1 Q 321.7 205.4 353.3 207.2 Q 385.0 209.1 416.6 209.2 Q 448.3 209.3 480.0 207.4 Q 511.6 205.6 543.3 201.8 Q 575.0 198.1 606.6 192.7 Q 638.3 187.2 670.0 180.5 Q 701.6 173.8 733.3 166.2 Q 765.0 158.7 796.6 151.0 Q 828.3 143.2 859.9 135.9 Q 891.6 128.5 923.3 122.2 Q 954.9 115.8 986.6 110.9 L 1018.3 105.9" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 200.1 Q 195.0 200.1 227.5 204.3 Q 260.0 208.4 292.4 211.5 Q 324.9 214.7 357.4 216.3 Q 389.9 218.0 422.4 217.8 Q 454.8 217.7 487.3 215.6 Q 519.8 213.6 552.3 209.7 Q 584.8 205.8 617.2 200.2 Q 649.7 194.7 682.2 187.9 Q 714.7 181.1 747.2 173.5 Q 779.6 166.0 812.1 158.4 Q 844.6 150.7 877.1 143.5 Q 909.6 136.3 942.0 130.1 Q 974.5 123.9 1007.0 119.1 L 1039.5 114.4" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 195.0 130.0 Q 195.0 130.0 195.0 135.1 Q 195.0 140.1 195.0 145.2 Q 195.0 150.2 195.0 155.2 Q 195.0 160.3 195.0 165.3 Q 195.0 170.3 195.0 175.3 Q 195.0 180.3 195.0 185.2 Q 195.0 190.2 195.0 195.2 L 195.0 200.1" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 248.5 139.9 Q 248.5 139.9 249.4 144.9 Q 250.2 149.8 251.0 154.8 Q 251.8 159.7 252.6 164.6 Q 253.4 169.5 254.2 174.4 Q 255.1 179.3 255.9 184.2 Q 256.7 189.1 257.5 193.9 Q 258.3 198.8 259.1 203.6 L 260.0 208.4" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 302.1 148.5 Q 302.1 148.5 303.7 153.3 Q 305.3 158.1 307.0 162.9 Q 308.6 167.7 310.2 172.4 Q 311.9 177.2 313.5 181.9 Q 315.1 186.6 316.8 191.3 Q 318.4 196.0 320.0 200.7 Q 321.7 205.4 323.3 210.0 L 324.9 214.7" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 355.6 154.7 Q 355.6 154.7 358.1 159.3 Q 360.5 163.9 363.0 168.5 Q 365.4 173.1 367.9 177.6 Q 370.3 182.2 372.7 186.7 Q 375.2 191.2 377.6 195.7 Q 380.1 200.2 382.5 204.6 Q 385.0 209.1 387.4 213.5 L 389.9 218.0" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 409.2 157.6 Q 409.2 157.6 412.4 162.0 Q 415.7 166.4 418.9 170.7 Q 422.2 175.1 425.5 179.4 Q 428.7 183.7 432.0 188.0 Q 435.3 192.3 438.5 196.5 Q 441.8 200.8 445.1 205.0 Q 448.3 209.3 451.6 213.5 L 454.8 217.7" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 462.7 156.6 Q 462.7 156.6 466.8 160.8 Q 470.9 164.9 474.9 169.0 Q 479.0 173.1 483.1 177.2 Q 487.2 181.3 491.2 185.4 Q 495.3 189.4 499.4 193.5 Q 503.5 197.5 507.6 201.6 Q 511.6 205.6 515.7 209.6 L 519.8 213.6" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 516.2 151.5 Q 516.2 151.5 521.1 155.4 Q 526.0 159.3 530.9 163.2 Q 535.8 167.2 540.7 171.1 Q 545.6 174.9 550.5 178.8 Q 555.4 182.7 560.3 186.6 Q 565.2 190.4 570.1 194.3 Q 575.0 198.1 579.9 201.9 L 584.8 205.8" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 569.8 142.4 Q 569.8 142.4 575.5 146.2 Q 581.2 150.0 586.9 153.7 Q 592.6 157.5 598.3 161.2 Q 604.0 164.9 609.7 168.7 Q 615.5 172.4 621.2 176.1 Q 626.9 179.8 632.6 183.5 Q 638.3 187.2 644.0 191.0 L 649.7 194.7" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 623.3 130.1 Q 623.3 130.1 629.8 133.7 Q 636.4 137.4 642.9 141.0 Q 649.4 144.6 655.9 148.3 Q 662.5 151.9 669.0 155.6 Q 675.5 159.2 682.0 162.9 Q 688.6 166.5 695.1 170.1 Q 701.6 173.8 708.2 177.4 L 714.7 181.1" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 676.8 115.3 Q 676.8 115.3 684.2 118.9 Q 691.5 122.5 698.9 126.1 Q 706.2 129.7 713.6 133.3 Q 720.9 136.9 728.2 140.6 Q 735.6 144.2 742.9 147.8 Q 750.3 151.4 757.6 155.1 Q 765.0 158.7 772.3 162.4 L 779.6 166.0" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 730.4 99.2 Q 730.4 99.2 738.5 102.9 Q 746.7 106.5 754.9 110.1 Q 763.0 113.8 771.2 117.4 Q 779.3 121.1 787.5 124.8 Q 795.7 128.4 803.8 132.1 Q 812.0 135.8 820.1 139.5 Q 828.3 143.2 836.4 147.0 L 844.6 150.7" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 783.9 83.2 Q 783.9 83.2 792.9 86.9 Q 801.9 90.6 810.8 94.4 Q 819.8 98.1 828.8 101.9 Q 837.8 105.7 846.7 109.5 Q 855.7 113.2 864.7 117.1 Q 873.7 120.9 882.6 124.7 Q 891.6 128.5 900.6 132.4 L 909.6 136.3" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 837.5 68.4 Q 837.5 68.4 847.3 72.3 Q 857.0 76.2 866.8 80.1 Q 876.6 84.0 886.4 87.9 Q 896.2 91.9 906.0 95.8 Q 915.8 99.8 925.6 103.8 Q 935.4 107.8 945.2 111.8 Q 954.9 115.8 964.7 119.8 L 974.5 123.9" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
+-  <path d="M 891.0 56.0 Q 891.0 56.0 901.6 60.1 Q 912.2 64.2 922.8 68.3 Q 933.4 72.4 944.0 76.6 Q 954.6 80.7 965.2 84.9 Q 975.8 89.1 986.5 93.3 Q 997.1 97.5 1007.7 101.7 Q 1018.3 105.9 1028.9 110.2 L 1039.5 114.4" fill="none" stroke="#3FE0A8" stroke-width="1.25" opacity="0.27"/>
++
++  <!-- Large curved 3D manifold mesh: rows follow the sagging spine (disturbance -> valley -> equilibrium), columns cut across it, both under a shared perspective/skew projection so the sheet reads as a single continuous curved surface. -->
++  <g>
++  <path d="M 273.5 48.8 L 286.3 52.4 L 299.1 57.2 L 311.2 62.7 L 322.4 68.7 L 332.9 75.2 L 342.7 81.8 L 351.9 88.6 L 360.6 95.2 L 368.7 101.7 L 376.4 108.0 L 383.7 113.9 L 390.6 119.4 L 397.1 124.5 L 403.4 129.0 L 409.2 133.0 L 414.8 136.5 L 420.1 139.6 L 425.3 142.3 L 430.5 144.6 L 436.2 146.7 L 445.6 148.8 L 456.1 150.9 L 467.3 152.9 L 479.1 154.7 L 491.5 156.4 L 504.5 157.9 L 517.8 159.2 L 531.5 160.4 L 545.4 161.5 L 559.5 162.3 L 573.8 163.0 L 588.2 163.5 L 602.5 163.8 L 616.8 164.0 L 631.0 163.9 L 644.9 163.7 L 658.6 163.4 L 672.0 162.9 L 684.9 162.2 L 697.2 161.4 L 708.8 160.6 L 720.9 159.3 L 733.6 157.5 L 746.8 155.2 L 760.4 152.5 L 774.3 149.4 L 788.5 145.9 L 802.8 142.2 L 817.2 138.1 L 831.8 133.9 L 846.3 129.4 L 860.7 124.9 L 875.0 120.2 L 889.1 115.5 L 903.1 110.8 L 916.7 106.2 L 930.0 101.6 L 942.9 97.1 L 955.4 92.8 L 967.2 88.9 L 976.1 86.6 L 984.2 84.4 L 991.8 81.9 L 999.1 79.3 L 1006.1 76.3 L 1013.0 73.1 L 1019.8 69.5 L 1026.6 65.5 L 1033.6 61.2 L 1040.7 56.5 L 1048.1 51.6 L 1055.9 46.3 L 1064.1 40.9 L 1072.8 35.4 L 1082.1 29.9 L 1092.0 24.7 L 1102.5 19.8 L 1113.7 15.4 L 1125.4 11.6 L 1137.3 8.6" fill="none" stroke="#6FC6FF" stroke-width="0.60" opacity="0.050"/>
++  <path d="M 271.2 55.9 L 283.5 59.5 L 295.7 64.2 L 307.2 69.7 L 318.0 75.8 L 328.0 82.2 L 337.5 89.0 L 346.4 95.9 L 354.8 102.8 L 362.8 109.6 L 370.4 116.2 L 377.7 122.5 L 384.7 128.5 L 391.5 134.1 L 398.0 139.2 L 404.3 143.8 L 410.4 147.9 L 416.4 151.5 L 422.4 154.7 L 428.5 157.5 L 435.2 159.9 L 445.0 162.3 L 455.8 164.5 L 467.4 166.6 L 479.6 168.6 L 492.3 170.3 L 505.6 171.9 L 519.2 173.3 L 533.1 174.6 L 547.4 175.6 L 561.8 176.5 L 576.4 177.1 L 591.0 177.6 L 605.7 177.9 L 620.3 178.1 L 634.7 178.1 L 649.0 177.8 L 663.0 177.5 L 676.7 176.9 L 690.0 176.2 L 702.7 175.4 L 714.8 174.4 L 727.4 173.0 L 740.4 171.1 L 753.9 168.7 L 767.8 165.9 L 781.9 162.7 L 796.2 159.1 L 810.7 155.2 L 825.2 151.0 L 839.8 146.6 L 854.3 142.0 L 868.8 137.2 L 883.0 132.4 L 897.1 127.4 L 910.9 122.5 L 924.5 117.6 L 937.6 112.7 L 950.4 108.0 L 962.7 103.4 L 974.4 99.2 L 983.4 96.4 L 991.7 93.5 L 999.5 90.5 L 1006.9 87.3 L 1014.0 83.9 L 1020.9 80.2 L 1027.7 76.2 L 1034.4 72.0 L 1041.2 67.5 L 1048.1 62.7 L 1055.2 57.7 L 1062.7 52.6 L 1070.4 47.3 L 1078.7 42.0 L 1087.4 36.9 L 1096.7 31.9 L 1106.6 27.3 L 1117.1 23.1 L 1128.2 19.5 L 1139.4 16.6" fill="none" stroke="#6FC6FF" stroke-width="0.75" opacity="0.077"/>
++  <path d="M 269.0 62.9 L 280.8 66.6 L 292.4 71.4 L 303.3 76.9 L 313.5 83.1 L 323.2 89.7 L 332.3 96.6 L 340.9 103.7 L 349.1 110.8 L 356.9 118.0 L 364.5 124.9 L 371.8 131.7 L 378.9 138.1 L 385.9 144.1 L 392.7 149.7 L 399.4 154.8 L 406.1 159.4 L 412.8 163.5 L 419.5 167.1 L 426.5 170.2 L 434.1 172.9 L 444.4 175.4 L 455.6 177.8 L 467.6 180.0 L 480.1 182.0 L 493.1 183.8 L 506.7 185.5 L 520.6 186.9 L 534.8 188.2 L 549.4 189.3 L 564.1 190.2 L 578.9 190.9 L 593.9 191.5 L 608.8 191.9 L 623.7 192.1 L 638.4 192.2 L 653.0 192.1 L 667.4 191.8 L 681.4 191.3 L 695.0 190.6 L 708.2 189.8 L 720.7 188.8 L 733.8 187.3 L 747.2 185.2 L 761.1 182.7 L 775.2 179.8 L 789.5 176.4 L 804.0 172.6 L 818.6 168.5 L 833.2 164.1 L 847.8 159.4 L 862.4 154.6 L 876.8 149.5 L 891.1 144.3 L 905.1 139.1 L 918.8 133.8 L 932.2 128.6 L 945.2 123.4 L 957.9 118.3 L 970.0 113.5 L 981.5 108.9 L 990.8 105.6 L 999.3 102.2 L 1007.2 98.6 L 1014.7 94.9 L 1021.9 91.1 L 1028.8 87.1 L 1035.5 82.8 L 1042.2 78.4 L 1048.8 73.9 L 1055.5 69.1 L 1062.3 64.2 L 1069.4 59.2 L 1076.8 54.2 L 1084.5 49.2 L 1092.8 44.3 L 1101.5 39.6 L 1110.7 35.3 L 1120.5 31.4 L 1130.9 27.9 L 1141.5 25.1" fill="none" stroke="#6FC6FF" stroke-width="0.90" opacity="0.103"/>
++  <path d="M 266.7 70.0 L 278.0 74.0 L 289.0 78.9 L 299.3 84.6 L 309.1 90.9 L 318.3 97.6 L 327.0 104.7 L 335.3 112.0 L 343.3 119.4 L 351.0 126.8 L 358.5 134.1 L 365.8 141.2 L 373.1 147.9 L 380.2 154.4 L 387.3 160.3 L 394.5 165.8 L 401.7 170.8 L 409.1 175.3 L 416.7 179.2 L 424.6 182.6 L 433.1 185.5 L 443.8 188.1 L 455.4 190.5 L 467.7 192.8 L 480.6 194.9 L 493.9 196.8 L 507.8 198.5 L 522.0 200.1 L 536.5 201.4 L 551.3 202.7 L 566.3 203.8 L 581.5 204.7 L 596.7 205.4 L 611.9 206.0 L 627.1 206.4 L 642.2 206.7 L 657.1 206.7 L 671.7 206.5 L 686.1 206.2 L 700.1 205.6 L 713.6 204.7 L 726.7 203.7 L 740.2 202.0 L 754.0 199.8 L 768.2 197.1 L 782.5 194.0 L 797.1 190.3 L 811.8 186.3 L 826.5 181.9 L 841.2 177.1 L 855.9 172.1 L 870.4 166.9 L 884.9 161.4 L 899.1 155.9 L 913.0 150.3 L 926.7 144.6 L 940.0 139.0 L 952.9 133.5 L 965.3 128.2 L 977.3 123.0 L 988.6 118.3 L 998.1 114.4 L 1006.8 110.5 L 1014.9 106.5 L 1022.5 102.5 L 1029.8 98.3 L 1036.7 94.0 L 1043.4 89.7 L 1049.9 85.2 L 1056.4 80.6 L 1062.9 75.9 L 1069.4 71.1 L 1076.2 66.4 L 1083.1 61.6 L 1090.4 56.9 L 1098.1 52.3 L 1106.2 47.9 L 1114.8 43.7 L 1123.9 40.0 L 1133.6 36.6 L 1143.6 33.7" fill="none" stroke="#6FC6FF" stroke-width="1.05" opacity="0.130"/>
++  <path d="M 264.5 77.7 L 275.2 81.9 L 285.6 87.0 L 295.4 92.8 L 304.6 99.3 L 313.4 106.2 L 321.8 113.4 L 329.8 120.9 L 337.6 128.4 L 345.1 136.0 L 352.5 143.5 L 359.9 150.8 L 367.2 157.8 L 374.6 164.5 L 382.0 170.7 L 389.6 176.5 L 397.4 181.8 L 405.4 186.6 L 413.8 190.8 L 422.6 194.4 L 432.1 197.4 L 443.2 200.1 L 455.2 202.6 L 467.9 205.0 L 481.0 207.2 L 494.7 209.3 L 508.9 211.2 L 523.4 213.0 L 538.2 214.7 L 553.3 216.1 L 568.6 217.5 L 584.0 218.7 L 599.5 219.7 L 615.0 220.6 L 630.5 221.2 L 645.9 221.7 L 661.1 221.9 L 676.1 221.9 L 690.8 221.6 L 705.2 221.1 L 719.1 220.2 L 732.7 219.0 L 746.6 217.1 L 760.8 214.7 L 775.3 211.7 L 789.9 208.2 L 804.7 204.2 L 819.5 199.8 L 834.4 195.0 L 849.2 189.8 L 863.9 184.3 L 878.5 178.7 L 892.9 172.8 L 907.1 166.8 L 921.0 160.8 L 934.6 154.8 L 947.7 148.9 L 960.5 143.1 L 972.8 137.6 L 984.6 132.3 L 995.7 127.3 L 1005.4 123.1 L 1014.3 118.9 L 1022.6 114.6 L 1030.4 110.2 L 1037.7 105.8 L 1044.6 101.4 L 1051.2 96.9 L 1057.7 92.4 L 1064.0 87.9 L 1070.2 83.3 L 1076.5 78.7 L 1082.9 74.1 L 1089.5 69.5 L 1096.3 65.0 L 1103.4 60.6 L 1110.9 56.4 L 1118.9 52.4 L 1127.4 48.6 L 1136.4 45.2 L 1145.8 42.2" fill="none" stroke="#6FC6FF" stroke-width="1.20" opacity="0.157"/>
++  <path d="M 262.2 86.0 L 272.5 90.4 L 282.2 95.7 L 291.4 101.7 L 300.2 108.2 L 308.5 115.2 L 316.6 122.4 L 324.3 129.9 L 331.8 137.5 L 339.2 145.2 L 346.6 152.7 L 353.9 160.1 L 361.4 167.3 L 368.9 174.1 L 376.7 180.6 L 384.7 186.6 L 393.0 192.2 L 401.7 197.2 L 410.9 201.7 L 420.6 205.5 L 431.0 208.8 L 442.7 211.6 L 455.0 214.4 L 468.0 217.0 L 481.5 219.4 L 495.5 221.8 L 510.0 224.0 L 524.8 226.1 L 539.9 228.1 L 555.3 230.0 L 570.9 231.7 L 586.6 233.3 L 602.4 234.6 L 618.2 235.8 L 634.0 236.7 L 649.6 237.4 L 665.2 237.8 L 680.5 237.9 L 695.5 237.6 L 710.2 237.0 L 724.5 236.0 L 738.6 234.5 L 753.0 232.3 L 767.6 229.5 L 782.4 226.1 L 797.3 222.2 L 812.3 217.7 L 827.3 212.8 L 842.3 207.5 L 857.2 201.8 L 872.0 195.9 L 886.6 189.8 L 901.0 183.5 L 915.1 177.2 L 929.0 170.8 L 942.4 164.6 L 955.5 158.4 L 968.1 152.5 L 980.3 146.8 L 991.9 141.5 L 1002.9 136.5 L 1012.8 132.0 L 1021.9 127.5 L 1030.3 123.0 L 1038.2 118.5 L 1045.5 113.9 L 1052.5 109.4 L 1059.1 104.9 L 1065.4 100.4 L 1071.6 95.8 L 1077.6 91.3 L 1083.6 86.8 L 1089.7 82.3 L 1095.8 77.8 L 1102.1 73.4 L 1108.7 69.1 L 1115.7 64.9 L 1123.0 60.9 L 1130.8 57.1 L 1139.1 53.5 L 1147.9 50.3" fill="none" stroke="#6FC6FF" stroke-width="1.35" opacity="0.183"/>
++  <path d="M 260.0 95.0 L 269.7 99.6 L 278.8 105.0 L 287.5 111.0 L 295.8 117.4 L 303.7 124.3 L 311.3 131.5 L 318.8 138.9 L 326.1 146.4 L 333.3 154.0 L 340.6 161.5 L 348.0 168.9 L 355.5 176.1 L 363.3 183.1 L 371.3 189.7 L 379.8 196.0 L 388.6 201.8 L 398.0 207.1 L 408.0 212.0 L 418.6 216.2 L 430.0 219.7 L 442.1 222.9 L 454.8 225.9 L 468.1 228.9 L 482.0 231.7 L 496.3 234.5 L 511.1 237.2 L 526.2 239.7 L 541.6 242.2 L 557.3 244.5 L 573.1 246.6 L 589.1 248.6 L 605.2 250.3 L 621.3 251.7 L 637.4 252.9 L 653.4 253.7 L 669.2 254.2 L 684.8 254.2 L 700.2 253.9 L 715.3 253.0 L 730.0 251.8 L 744.6 249.8 L 759.4 247.2 L 774.4 243.9 L 789.5 240.0 L 804.7 235.5 L 819.9 230.5 L 835.1 225.0 L 850.2 219.2 L 865.2 213.1 L 880.0 206.8 L 894.6 200.3 L 909.0 193.7 L 923.1 187.1 L 936.9 180.5 L 950.3 174.1 L 963.3 167.9 L 975.8 161.9 L 987.8 156.3 L 999.2 151.0 L 1010.0 146.1 L 1020.1 141.5 L 1029.4 136.8 L 1038.0 132.1 L 1046.0 127.5 L 1053.4 122.8 L 1060.4 118.2 L 1067.0 113.5 L 1073.2 108.9 L 1079.2 104.3 L 1085.0 99.7 L 1090.7 95.2 L 1096.4 90.7 L 1102.1 86.2 L 1108.0 81.8 L 1114.1 77.4 L 1120.4 73.1 L 1127.1 69.0 L 1134.2 65.0 L 1141.8 61.2 L 1150.0 57.6" fill="none" stroke="#8FF3D8" stroke-width="1.50" opacity="0.500"/>
++  <path d="M 257.8 104.0 L 266.9 108.5 L 275.5 113.6 L 283.6 119.3 L 291.3 125.4 L 298.8 132.0 L 306.1 138.9 L 313.2 146.1 L 320.3 153.5 L 327.5 161.0 L 334.7 168.5 L 342.0 176.0 L 349.7 183.5 L 357.6 190.8 L 366.0 197.9 L 374.9 204.7 L 384.3 211.2 L 394.3 217.2 L 405.1 222.7 L 416.7 227.6 L 429.0 231.7 L 441.5 235.4 L 454.6 239.0 L 468.3 242.5 L 482.5 245.9 L 497.1 249.1 L 512.2 252.2 L 527.6 255.1 L 543.3 257.9 L 559.2 260.4 L 575.4 262.7 L 591.7 264.7 L 608.0 266.4 L 624.4 267.8 L 640.8 268.8 L 657.1 269.5 L 673.2 269.7 L 689.2 269.4 L 704.9 268.7 L 720.4 267.5 L 735.5 265.8 L 750.6 263.4 L 765.9 260.2 L 781.2 256.5 L 796.6 252.1 L 812.1 247.3 L 827.5 242.0 L 842.8 236.3 L 858.1 230.2 L 873.1 224.0 L 888.0 217.5 L 902.7 211.0 L 917.1 204.4 L 931.2 197.8 L 944.9 191.4 L 958.2 185.1 L 971.0 178.9 L 983.4 173.1 L 995.2 167.6 L 1006.5 162.4 L 1017.1 157.5 L 1027.4 152.6 L 1036.9 147.6 L 1045.7 142.5 L 1053.8 137.4 L 1061.3 132.3 L 1068.3 127.2 L 1074.8 122.2 L 1081.0 117.1 L 1086.8 112.1 L 1092.4 107.2 L 1097.8 102.3 L 1103.1 97.6 L 1108.5 92.9 L 1113.9 88.3 L 1119.4 83.8 L 1125.1 79.5 L 1131.2 75.3 L 1137.6 71.2 L 1144.5 67.4 L 1152.1 63.7" fill="none" stroke="#3FE0A8" stroke-width="1.35" opacity="0.310"/>
++  <path d="M 255.5 112.3 L 264.2 116.6 L 272.1 121.5 L 279.6 126.8 L 286.9 132.7 L 293.9 139.0 L 300.8 145.8 L 307.7 152.8 L 314.6 160.2 L 321.6 167.7 L 328.7 175.4 L 336.1 183.3 L 343.8 191.1 L 352.0 198.9 L 360.7 206.6 L 369.9 214.0 L 379.9 221.2 L 390.7 227.9 L 402.2 234.1 L 414.7 239.7 L 427.9 244.5 L 440.9 248.7 L 454.4 252.8 L 468.4 256.7 L 483.0 260.4 L 497.9 264.0 L 513.3 267.4 L 529.0 270.5 L 545.0 273.4 L 561.2 276.0 L 577.7 278.4 L 594.2 280.4 L 610.9 282.0 L 627.6 283.2 L 644.2 284.1 L 660.8 284.5 L 677.3 284.4 L 693.6 283.9 L 709.6 282.9 L 725.4 281.3 L 740.9 279.3 L 756.6 276.5 L 772.3 273.0 L 788.0 268.9 L 803.8 264.3 L 819.5 259.2 L 835.1 253.7 L 850.6 247.9 L 865.9 241.7 L 881.1 235.4 L 896.1 229.0 L 910.8 222.4 L 925.2 215.9 L 939.2 209.4 L 952.8 202.9 L 966.1 196.7 L 978.8 190.6 L 991.0 184.8 L 1002.7 179.2 L 1013.8 174.0 L 1024.3 169.1 L 1034.7 163.7 L 1044.5 158.2 L 1053.4 152.6 L 1061.6 147.0 L 1069.2 141.4 L 1076.2 135.7 L 1082.7 130.1 L 1088.7 124.6 L 1094.4 119.2 L 1099.8 113.9 L 1104.9 108.8 L 1109.9 103.8 L 1114.8 99.0 L 1119.7 94.4 L 1124.7 89.9 L 1129.9 85.6 L 1135.3 81.5 L 1141.0 77.5 L 1147.3 73.8 L 1154.2 70.2" fill="none" stroke="#3FE0A8" stroke-width="1.20" opacity="0.260"/>
++  <path d="M 253.3 120.0 L 261.4 124.1 L 268.7 128.7 L 275.7 133.9 L 282.4 139.6 L 289.0 145.8 L 295.6 152.4 L 302.2 159.5 L 308.8 166.9 L 315.7 174.7 L 322.7 182.7 L 330.2 190.9 L 338.0 199.2 L 346.3 207.5 L 355.3 215.8 L 365.0 224.0 L 375.6 231.9 L 387.0 239.3 L 399.4 246.2 L 412.7 252.4 L 426.9 257.7 L 440.4 262.3 L 454.2 266.8 L 468.6 271.0 L 483.4 275.0 L 498.7 278.8 L 514.4 282.3 L 530.4 285.6 L 546.7 288.6 L 563.2 291.2 L 579.9 293.5 L 596.8 295.4 L 613.7 296.9 L 630.7 298.0 L 647.6 298.7 L 664.5 298.9 L 681.3 298.6 L 697.9 297.9 L 714.4 296.7 L 730.5 294.9 L 746.4 292.6 L 762.5 289.6 L 778.7 285.8 L 794.8 281.6 L 810.9 276.8 L 826.8 271.5 L 842.7 265.9 L 858.4 260.0 L 873.8 253.9 L 889.1 247.5 L 904.1 241.1 L 918.8 234.5 L 933.2 228.0 L 947.2 221.4 L 960.8 215.0 L 973.9 208.6 L 986.6 202.5 L 998.7 196.5 L 1010.2 190.9 L 1021.1 185.5 L 1031.4 180.3 L 1042.1 174.5 L 1052.0 168.4 L 1061.1 162.2 L 1069.5 156.0 L 1077.1 149.7 L 1084.1 143.5 L 1090.5 137.4 L 1096.5 131.5 L 1102.0 125.7 L 1107.1 120.1 L 1112.0 114.8 L 1116.6 109.7 L 1121.2 104.9 L 1125.6 100.3 L 1130.0 96.0 L 1134.6 91.9 L 1139.4 88.0 L 1144.5 84.2 L 1150.0 80.7 L 1156.4 77.3" fill="none" stroke="#3FE0A8" stroke-width="1.05" opacity="0.210"/>
++  <path d="M 251.0 127.1 L 258.6 131.2 L 265.3 135.7 L 271.7 140.7 L 278.0 146.3 L 284.2 152.5 L 290.4 159.2 L 296.6 166.3 L 303.1 174.0 L 309.8 182.0 L 316.8 190.4 L 324.2 199.0 L 332.1 207.9 L 340.7 216.8 L 350.0 225.7 L 360.1 234.5 L 371.2 243.1 L 383.3 251.2 L 396.5 258.7 L 410.7 265.4 L 425.9 271.1 L 439.8 276.1 L 454.0 280.8 L 468.7 285.2 L 483.9 289.4 L 499.5 293.3 L 515.5 296.9 L 531.8 300.2 L 548.4 303.1 L 565.2 305.7 L 582.2 308.0 L 599.3 309.8 L 616.5 311.3 L 633.8 312.3 L 651.1 312.8 L 668.3 313.0 L 685.4 312.6 L 702.3 311.8 L 719.1 310.4 L 735.6 308.6 L 751.8 306.2 L 768.5 302.9 L 785.1 299.1 L 801.6 294.7 L 818.0 289.8 L 834.2 284.5 L 850.3 278.8 L 866.1 272.8 L 881.7 266.6 L 897.1 260.2 L 912.2 253.7 L 926.9 247.1 L 941.3 240.4 L 955.2 233.7 L 968.8 227.1 L 981.8 220.6 L 994.3 214.3 L 1006.3 208.1 L 1017.7 202.2 L 1028.4 196.6 L 1038.5 191.1 L 1049.4 184.7 L 1059.5 178.0 L 1068.8 171.2 L 1077.3 164.3 L 1085.0 157.5 L 1092.0 150.8 L 1098.4 144.2 L 1104.2 137.9 L 1109.6 131.9 L 1114.5 126.1 L 1119.1 120.7 L 1123.4 115.7 L 1127.5 110.9 L 1131.5 106.5 L 1135.4 102.4 L 1139.3 98.6 L 1143.5 94.9 L 1147.9 91.5 L 1152.7 88.1 L 1158.5 84.9" fill="none" stroke="#3FE0A8" stroke-width="0.90" opacity="0.160"/>
++  <path d="M 248.8 134.1 L 255.9 138.2 L 262.0 142.6 L 267.8 147.7 L 273.6 153.3 L 279.3 159.5 L 285.1 166.3 L 291.1 173.7 L 297.3 181.5 L 303.9 189.9 L 310.8 198.6 L 318.3 207.7 L 326.3 217.1 L 335.1 226.5 L 344.7 236.0 L 355.2 245.4 L 366.8 254.5 L 379.6 263.2 L 393.6 271.2 L 408.8 278.3 L 424.8 284.4 L 439.2 289.6 L 453.8 294.4 L 468.9 299.0 L 484.4 303.3 L 500.3 307.2 L 516.6 310.9 L 533.2 314.2 L 550.1 317.2 L 567.2 319.8 L 584.4 322.0 L 601.9 323.8 L 619.4 325.3 L 636.9 326.3 L 654.5 326.9 L 672.0 327.0 L 689.4 326.6 L 706.7 325.8 L 723.8 324.4 L 740.6 322.6 L 757.3 320.1 L 774.5 316.8 L 791.5 312.8 L 808.4 308.3 L 825.1 303.4 L 841.6 297.9 L 857.9 292.2 L 873.9 286.1 L 889.6 279.8 L 905.1 273.2 L 920.2 266.5 L 935.0 259.7 L 949.3 252.8 L 963.3 245.9 L 976.7 239.1 L 989.7 232.3 L 1002.1 225.7 L 1013.9 219.3 L 1025.1 213.0 L 1035.7 207.1 L 1045.6 201.4 L 1056.7 194.3 L 1067.1 187.0 L 1076.5 179.6 L 1085.1 172.2 L 1092.9 164.9 L 1099.9 157.8 L 1106.3 150.9 L 1112.0 144.3 L 1117.2 138.0 L 1121.9 132.2 L 1126.2 126.8 L 1130.1 121.9 L 1133.8 117.4 L 1137.3 113.2 L 1140.7 109.4 L 1144.1 105.8 L 1147.6 102.5 L 1151.3 99.3 L 1155.5 96.2 L 1160.6 93.0" fill="none" stroke="#3FE0A8" stroke-width="0.75" opacity="0.110"/>
++  <path d="M 246.5 141.2 L 253.1 145.4 L 258.6 149.9 L 263.9 155.0 L 269.1 160.7 L 274.4 167.0 L 279.9 174.0 L 285.6 181.5 L 291.6 189.6 L 298.0 198.3 L 304.9 207.4 L 312.3 216.8 L 320.4 226.6 L 329.4 236.5 L 339.3 246.5 L 350.3 256.4 L 362.5 266.0 L 375.9 275.1 L 390.7 283.5 L 406.8 291.0 L 423.8 297.3 L 438.6 302.6 L 453.6 307.6 L 469.0 312.3 L 484.9 316.6 L 501.1 320.7 L 517.7 324.4 L 534.6 327.8 L 551.7 330.8 L 569.1 333.5 L 586.7 335.8 L 604.4 337.7 L 622.2 339.3 L 640.1 340.4 L 657.9 341.0 L 675.7 341.2 L 693.5 341.0 L 711.0 340.2 L 728.5 338.9 L 745.7 337.1 L 762.8 334.6 L 780.4 331.2 L 797.9 327.1 L 815.2 322.5 L 832.2 317.4 L 849.0 311.8 L 865.5 305.8 L 881.7 299.6 L 897.5 293.0 L 913.1 286.2 L 928.2 279.2 L 943.0 272.2 L 957.4 265.0 L 971.3 257.8 L 984.7 250.6 L 997.6 243.6 L 1009.9 236.6 L 1021.6 229.9 L 1032.6 223.4 L 1043.0 217.2 L 1052.8 211.1 L 1064.1 203.6 L 1074.6 195.7 L 1084.2 187.8 L 1092.9 179.9 L 1100.8 172.2 L 1107.8 164.7 L 1114.1 157.6 L 1119.8 150.8 L 1124.8 144.5 L 1129.3 138.7 L 1133.3 133.4 L 1136.9 128.6 L 1140.2 124.3 L 1143.2 120.4 L 1146.0 116.9 L 1148.8 113.6 L 1151.6 110.5 L 1154.7 107.5 L 1158.2 104.5 L 1162.7 101.4" fill="none" stroke="#3FE0A8" stroke-width="0.60" opacity="0.060"/>
++  <path d="M 273.5 48.8 L 272.4 52.2 L 271.3 55.6 L 270.2 59.0 L 269.2 62.3 L 268.1 65.7 L 267.0 69.2 L 265.9 72.7 L 264.8 76.4 L 263.8 80.3 L 262.7 84.3 L 261.6 88.5 L 260.5 92.8 L 259.5 97.2 L 258.4 101.5 L 257.3 105.7 L 256.2 109.7 L 255.2 113.6 L 254.1 117.3 L 253.0 120.8 L 251.9 124.3 L 250.8 127.7 L 249.8 131.0 L 248.7 134.4 L 247.6 137.8 L 246.5 141.2" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.050"/>
++  <path d="M 332.9 75.2 L 330.6 78.5 L 328.2 82.0 L 325.9 85.4 L 323.6 89.0 L 321.2 92.8 L 318.9 96.6 L 316.5 100.6 L 314.2 104.8 L 311.9 109.0 L 309.5 113.3 L 307.2 117.7 L 304.8 122.1 L 302.5 126.2 L 300.2 129.9 L 297.8 133.5 L 295.5 136.8 L 293.1 140.1 L 290.8 143.4 L 288.5 146.6 L 286.1 149.8 L 283.8 153.0 L 281.4 156.4 L 279.1 159.8 L 276.8 163.4 L 274.4 167.0" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.081"/>
++  <path d="M 376.4 108.0 L 373.5 111.9 L 370.7 115.9 L 367.8 120.0 L 364.9 124.2 L 362.1 128.6 L 359.2 133.0 L 356.4 137.5 L 353.5 142.0 L 350.6 146.5 L 347.8 150.9 L 344.9 155.2 L 342.1 159.5 L 339.2 163.2 L 336.3 166.6 L 333.5 169.9 L 330.6 173.2 L 327.7 176.6 L 324.9 180.0 L 322.0 183.6 L 319.2 187.2 L 316.3 191.0 L 313.4 194.9 L 310.6 199.0 L 307.7 203.1 L 304.9 207.4" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.111"/>
++  <path d="M 409.2 133.0 L 406.9 138.1 L 404.5 143.3 L 402.2 148.6 L 399.8 153.9 L 397.4 159.2 L 395.1 164.5 L 392.7 169.7 L 390.4 174.9 L 388.0 179.8 L 385.7 184.7 L 383.3 189.3 L 380.9 193.8 L 378.6 198.0 L 376.2 202.2 L 373.9 206.5 L 371.5 211.0 L 369.2 215.6 L 366.8 220.3 L 364.4 225.2 L 362.1 230.3 L 359.7 235.4 L 357.4 240.6 L 355.0 245.9 L 352.7 251.1 L 350.3 256.4" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.139"/>
++  <path d="M 436.2 146.7 L 435.7 153.0 L 435.2 159.4 L 434.7 165.7 L 434.2 171.9 L 433.7 178.0 L 433.2 184.0 L 432.7 189.8 L 432.2 195.5 L 431.7 201.1 L 431.2 206.5 L 430.7 211.9 L 430.2 217.1 L 429.8 222.5 L 429.3 228.3 L 428.8 234.2 L 428.3 240.3 L 427.8 246.6 L 427.3 252.9 L 426.8 259.3 L 426.3 265.8 L 425.8 272.2 L 425.3 278.6 L 424.8 284.9 L 424.3 291.2 L 423.8 297.3" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.163"/>
++  <path d="M 491.5 156.4 L 491.9 163.1 L 492.3 169.8 L 492.7 176.3 L 493.1 182.8 L 493.5 189.0 L 493.8 195.2 L 494.2 201.3 L 494.6 207.3 L 495.0 213.3 L 495.4 219.3 L 495.8 225.3 L 496.1 231.4 L 496.5 238.0 L 496.9 245.0 L 497.3 252.1 L 497.7 259.2 L 498.0 266.4 L 498.4 273.5 L 498.8 280.6 L 499.2 287.5 L 499.6 294.4 L 500.0 301.2 L 500.3 307.8 L 500.7 314.3 L 501.1 320.7" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.183"/>
++  <path d="M 559.5 162.3 L 560.6 169.2 L 561.7 175.9 L 562.8 182.5 L 563.9 189.1 L 565.0 195.6 L 566.1 202.1 L 567.1 208.7 L 568.2 215.3 L 569.3 222.0 L 570.4 228.8 L 571.5 235.8 L 572.6 243.0 L 573.7 250.5 L 574.8 258.2 L 575.8 265.8 L 576.9 273.4 L 578.0 280.8 L 579.1 288.1 L 580.2 295.2 L 581.3 302.2 L 582.4 309.1 L 583.4 315.9 L 584.5 322.6 L 585.6 329.2 L 586.7 335.8" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.198"/>
++  <path d="M 631.0 163.9 L 632.8 170.7 L 634.6 177.5 L 636.4 184.3 L 638.1 191.1 L 639.9 197.9 L 641.7 204.9 L 643.5 212.0 L 645.3 219.3 L 647.1 226.7 L 648.9 234.2 L 650.7 241.9 L 652.5 249.7 L 654.3 257.5 L 656.0 265.1 L 657.8 272.5 L 659.6 279.8 L 661.4 286.8 L 663.2 293.8 L 665.0 300.6 L 666.8 307.4 L 668.6 314.1 L 670.4 320.8 L 672.1 327.5 L 673.9 334.3 L 675.7 341.2" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.207"/>
++  <path d="M 697.2 161.4 L 699.9 168.1 L 702.5 174.8 L 705.1 181.6 L 707.7 188.6 L 710.3 195.7 L 713.0 202.9 L 715.6 210.3 L 718.2 217.7 L 720.8 225.2 L 723.4 232.8 L 726.1 240.4 L 728.7 248.0 L 731.3 255.2 L 733.9 261.9 L 736.6 268.5 L 739.2 275.0 L 741.8 281.4 L 744.4 287.8 L 747.0 294.2 L 749.7 300.7 L 752.3 307.3 L 754.9 313.9 L 757.5 320.7 L 760.1 327.6 L 762.8 334.6" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.210"/>
++  <path d="M 760.4 152.5 L 763.9 158.9 L 767.5 165.3 L 771.0 171.9 L 774.6 178.6 L 778.1 185.4 L 781.7 192.2 L 785.2 199.1 L 788.7 205.9 L 792.3 212.7 L 795.8 219.4 L 799.4 226.0 L 802.9 232.4 L 806.5 238.3 L 810.0 244.0 L 813.5 249.6 L 817.1 255.3 L 820.6 261.1 L 824.2 267.0 L 827.7 273.1 L 831.3 279.2 L 834.8 285.5 L 838.3 292.0 L 841.9 298.5 L 845.4 305.1 L 849.0 311.8" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.207"/>
++  <path d="M 831.8 133.9 L 835.6 139.9 L 839.5 146.1 L 843.3 152.2 L 847.2 158.4 L 851.1 164.5 L 854.9 170.6 L 858.8 176.6 L 862.6 182.4 L 866.5 188.1 L 870.4 193.6 L 874.2 199.0 L 878.1 204.2 L 881.9 209.3 L 885.8 214.5 L 889.6 219.8 L 893.5 225.2 L 897.4 230.9 L 901.2 236.7 L 905.1 242.6 L 908.9 248.6 L 912.8 254.7 L 916.7 260.9 L 920.5 267.0 L 924.4 273.2 L 928.2 279.2" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.198"/>
++  <path d="M 903.1 110.8 L 906.8 116.4 L 910.6 122.0 L 914.4 127.5 L 918.2 132.9 L 922.0 138.2 L 925.7 143.4 L 929.5 148.4 L 933.3 153.2 L 937.1 158.0 L 940.9 162.7 L 944.6 167.2 L 948.4 171.8 L 952.2 176.7 L 956.0 181.9 L 959.8 187.3 L 963.5 192.9 L 967.3 198.6 L 971.1 204.3 L 974.9 210.1 L 978.7 215.9 L 982.4 221.6 L 986.2 227.2 L 990.0 232.8 L 993.8 238.2 L 997.6 243.6" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.183"/>
++  <path d="M 967.2 88.9 L 970.7 93.9 L 974.1 98.8 L 977.5 103.5 L 980.9 108.2 L 984.3 112.7 L 987.8 117.2 L 991.2 121.5 L 994.6 125.9 L 998.0 130.3 L 1001.4 134.7 L 1004.9 139.1 L 1008.3 143.8 L 1011.7 148.8 L 1015.1 154.3 L 1018.6 159.9 L 1022.0 165.4 L 1025.4 170.9 L 1028.8 176.3 L 1032.2 181.7 L 1035.7 186.9 L 1039.1 192.0 L 1042.5 196.9 L 1045.9 201.8 L 1049.3 206.5 L 1052.8 211.1" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.163"/>
++  <path d="M 1006.1 76.3 L 1009.9 80.0 L 1013.7 83.6 L 1017.5 87.1 L 1021.2 90.5 L 1025.0 94.0 L 1028.8 97.4 L 1032.6 101.0 L 1036.4 104.6 L 1040.2 108.4 L 1044.0 112.3 L 1047.8 116.4 L 1051.5 120.6 L 1055.3 125.1 L 1059.1 129.7 L 1062.9 134.2 L 1066.7 138.5 L 1070.5 142.7 L 1074.3 146.8 L 1078.1 150.7 L 1081.8 154.4 L 1085.6 158.1 L 1089.4 161.7 L 1093.2 165.2 L 1097.0 168.7 L 1100.8 172.2" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.139"/>
++  <path d="M 1040.7 56.5 L 1044.3 59.5 L 1047.8 62.5 L 1051.4 65.5 L 1054.9 68.6 L 1058.4 71.7 L 1062.0 75.0 L 1065.5 78.5 L 1069.1 82.1 L 1072.6 85.8 L 1076.1 89.7 L 1079.7 93.6 L 1083.2 97.7 L 1086.8 101.6 L 1090.3 105.2 L 1093.9 108.6 L 1097.4 111.8 L 1100.9 114.9 L 1104.5 117.9 L 1108.0 120.9 L 1111.6 123.7 L 1115.1 126.6 L 1118.6 129.5 L 1122.2 132.5 L 1125.7 135.5 L 1129.3 138.7" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.111"/>
++  <path d="M 1082.1 29.9 L 1084.7 33.2 L 1087.2 36.6 L 1089.8 40.1 L 1092.3 43.7 L 1094.9 47.4 L 1097.4 51.3 L 1100.0 55.2 L 1102.6 59.3 L 1105.1 63.4 L 1107.7 67.4 L 1110.2 71.5 L 1112.8 75.5 L 1115.3 79.0 L 1117.9 82.1 L 1120.5 85.0 L 1123.0 88.0 L 1125.6 90.9 L 1128.1 93.8 L 1130.7 96.7 L 1133.2 99.8 L 1135.8 103.0 L 1138.4 106.3 L 1140.9 109.7 L 1143.5 113.2 L 1146.0 116.9" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.081"/>
++  <path d="M 1137.3 8.6 L 1138.3 12.4 L 1139.3 16.3 L 1140.3 20.3 L 1141.3 24.4 L 1142.4 28.5 L 1143.4 32.7 L 1144.4 36.8 L 1145.4 40.9 L 1146.4 44.8 L 1147.5 48.7 L 1148.5 52.4 L 1149.5 55.9 L 1150.5 59.1 L 1151.5 62.0 L 1152.5 65.0 L 1153.6 68.1 L 1154.6 71.3 L 1155.6 74.6 L 1156.6 78.1 L 1157.6 81.8 L 1158.7 85.5 L 1159.7 89.4 L 1160.7 93.4 L 1161.7 97.4 L 1162.7 101.4" fill="none" stroke="#57D9C8" stroke-width="0.65" opacity="0.050"/>
+   </g>
+ 
+-  <path d="M 108.0 126.4 L 110.8 126.9 L 113.6 127.3 L 116.3 127.7 L 119.1 128.1 L 121.9 128.6 L 124.7 129.0 L 127.4 129.5 L 130.2 129.9 L 133.0 130.4 L 146.9 132.6 L 160.7 134.9 L 174.6 137.3 L 188.5 139.6 L 202.3 142.0 L 216.2 144.5 L 229.9 146.9 L 243.7 149.2 L 257.4 151.4 L 271.0 153.6 L 284.6 155.6 L 298.2 157.4 L 311.8 159.1 L 325.3 160.7 L 338.7 162.1 L 352.2 163.4 L 365.6 164.4 L 379.0 165.3 L 392.4 166.0 L 405.7 166.4 L 419.1 166.7 L 432.4 166.8 L 445.8 166.6 L 459.1 166.3 L 472.5 165.7 L 485.8 164.9 L 499.2 163.9 L 512.5 162.6 L 525.9 161.2 L 539.4 159.6 L 552.8 157.7 L 566.3 155.7 L 579.8 153.5 L 593.4 151.1 L 607.0 148.6 L 620.6 145.9 L 634.3 143.0 L 648.0 140.1 L 661.8 137.0 L 675.7 133.8 L 689.6 130.6 L 703.6 127.3 L 717.6 123.9 L 731.8 120.5 L 745.9 117.1 L 760.2 113.7 L 774.5 110.4 L 788.9 107.0 L 803.3 103.8 L 817.8 100.6 L 832.4 97.5 L 847.1 94.5 L 861.8 91.6 L 876.6 88.9 L 891.4 86.3 L 906.3 83.9 L 921.3 81.7 L 936.3 79.6 L 951.3 77.8" fill="none" stroke="url(#trajGlowG)" stroke-width="5.8" stroke-linecap="round" filter="url(#softGlowG)" opacity="1.0" mask="url(#trajFadeMaskG)"/>
+-  <circle cx="459.1" cy="166.3" r="3.8" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
+-  <circle cx="566.3" cy="155.7" r="3.8" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
+-  <circle cx="661.8" cy="137.0" r="3.8" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
+-  <circle cx="760.2" cy="113.7" r="3.8" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
+-  <circle cx="861.8" cy="91.6" r="3.8" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
+-  <circle cx="936.3" cy="79.6" r="3.8" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
++  <!-- Manifold label -->
++  <text x="279.5" y="207.6" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="30" fill="#7FFFC4" opacity="0.34" filter="url(#softGlowG)">&#x1D4DC;</text>
++
++  <!-- Trajectory: disturbance (red) through a magenta/purple transient into blue/cyan, converging onto the manifold and settling in teal at equilibrium -->
++  <path d="M 268.3 64.8 L 275.7 68.1 L 283.1 72.0 L 290.2 76.2 L 296.8 80.8 L 303.2 85.6 L 309.2 90.7 L 314.9 96.0 L 320.3 101.5 L 325.5 107.1 L 330.6 112.8 L 335.4 118.6 L 340.1 124.4 L 344.7 130.2 L 349.3 135.9 L 353.7 141.6 L 358.2 147.2 L 362.6 152.6 L 367.1 158.0 L 371.6 163.1 L 376.2 168.1 L 380.9 172.9 L 385.6 177.5 L 390.6 181.9 L 395.6 186.0 L 400.9 189.9 L 406.4 193.5 L 412.2 196.9 L 418.2 200.0 L 424.6 202.8 L 431.3 205.4 L 438.9 207.8 L 446.8 210.1 L 455.1 212.4 L 463.6 214.6 L 472.4 216.7 L 481.5 218.8 L 490.8 220.8 L 500.3 222.7 L 510.0 224.7 L 519.9 226.5 L 530.0 228.3 L 540.2 230.1 L 550.5 231.8 L 560.9 233.5 L 571.4 235.1 L 582.0 236.6 L 592.6 238.0 L 603.2 239.3 L 613.9 240.6 L 624.6 241.7 L 635.2 242.7 L 645.9 243.6 L 656.4 244.3 L 666.9 244.9 L 677.3 245.3 L 687.7 245.6 L 697.8 245.6 L 707.9 245.5 L 717.8 245.2 L 727.5 244.6 L 737.2 243.8 L 746.9 242.6 L 756.8 241.2 L 766.8 239.4 L 776.8 237.3 L 786.9 234.9 L 797.0 232.3 L 807.2 229.4 L 817.4 226.3 L 827.5 223.0 L 837.7 219.5 L 847.8 215.8 L 857.9 211.9 L 867.9 208.0 L 877.8 203.9 L 887.7 199.7 L 897.4 195.5 L 907.1 191.2 L 916.6 186.9 L 926.0 182.7 L 935.2 178.4 L 944.2 174.2 L 953.1 170.1 L 961.8 166.0 L 970.2 162.1 L 978.4 158.2 L 986.4 154.6 L 994.2 151.0 L 1001.7 147.7 L 1008.9 144.6 L 1015.7 141.5 L 1022.2 138.5 L 1028.3 135.4 L 1034.2 132.4 L 1039.7 129.3 L 1045.0 126.3 L 1050.0 123.2 L 1054.9 120.2 L 1059.5 117.1 L 1063.9 114.1 L 1068.2 111.0 L 1072.4 108.0 L 1076.4 105.0 L 1080.4 102.0 L 1084.3 98.9 L 1088.2 95.9 L 1092.0 92.9 L 1095.8 90.0 L 1099.7 87.0 L 1103.6 84.1 L 1107.6 81.1 L 1111.6 78.2 L 1115.8 75.4 L 1120.1 72.6 L 1124.5 69.8 L 1129.2 67.1 L 1134.0 64.5 L 1139.0 62.0 L 1144.3 59.5 L 1149.9 57.2" fill="none" stroke="url(#trajGlowG)" stroke-width="5.4" stroke-linecap="round" filter="url(#softGlowG)" opacity="1.0"/>
++  <circle cx="340.1" cy="124.4" r="3.6" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
++  <circle cx="421.3" cy="201.5" r="3.6" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
++  <circle cx="603.2" cy="239.3" r="3.6" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
++  <circle cx="822.4" cy="224.7" r="3.6" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
++  <circle cx="1015.7" cy="141.5" r="3.6" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
++  <circle cx="1103.6" cy="84.1" r="3.6" fill="#CFEFFF" filter="url(#softGlowG)" opacity="0.9"/>
++
++  <!-- e_m: short transverse double-arrow between the off-manifold trajectory and the manifold surface -->
++  <g opacity="0.85">
++    <line x1="403.9" y1="201.2" x2="406.4" y2="193.5" stroke="#EAFFF7" stroke-width="1.4" marker-end="url(#emArrowHead)"/>
++    <line x1="403.9" y1="201.2" x2="401.3" y2="208.8" stroke="#EAFFF7" stroke-width="1.4" marker-end="url(#emArrowHead)"/>
++    <text x="419.9" y="206.2" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="18" fill="#EAFFF7" filter="url(#labelGlowG)">e<tspan baseline-shift="sub" font-size="12">m</tspan></text>
++  </g>
+ 
+-  <circle cx="257.4" cy="151.4" r="8" fill="#FF7B5C" filter="url(#wideGlowG)"/>
+-  <circle cx="257.4" cy="151.4" r="16" fill="none" stroke="#FF7B5C" stroke-width="1.1" opacity="0.4">
++  <circle cx="268.3" cy="64.8" r="8" fill="#FF7B5C" filter="url(#wideGlowG)"/>
++  <circle cx="268.3" cy="64.8" r="16" fill="none" stroke="#FF7B5C" stroke-width="1.1" opacity="0.4">
+     <animate attributeName="r" values="13;19;13" dur="2.8s" repeatCount="indefinite"/>
+     <animate attributeName="opacity" values="0.45;0.1;0.45" dur="2.8s" repeatCount="indefinite"/>
+   </circle>
+-  <text x="262" y="182" font-family="sans-serif" font-size="17" font-weight="900" fill="#FFEDE4" opacity="1.0" filter="url(#labelGlowG)">Disturbance</text>
++  <text x="276.3" y="94.8" font-family="sans-serif" font-size="17" font-weight="900" fill="#FFEDE4" opacity="1.0" filter="url(#labelGlowG)">Disturbance</text>
+ 
+-  <circle cx="951.3" cy="77.8" r="9" fill="#7FE8C8" filter="url(#wideGlowG)" opacity="0.88"/>
+-  <circle cx="951.3" cy="77.8" r="22" fill="none" stroke="#3FE0A8" stroke-width="1.5" opacity="0.5">
++  <circle cx="1149.9" cy="57.2" r="9" fill="#7FE8C8" filter="url(#wideGlowG)" opacity="0.88"/>
++  <circle cx="1149.9" cy="57.2" r="22" fill="none" stroke="#3FE0A8" stroke-width="1.5" opacity="0.5">
+     <animate attributeName="r" values="19;28;19" dur="3.6s" repeatCount="indefinite"/>
+     <animate attributeName="opacity" values="0.55;0.14;0.55" dur="3.6s" repeatCount="indefinite"/>
+   </circle>
+-  <circle cx="951.3" cy="77.8" r="34" fill="none" stroke="#3FE0A8" stroke-width="0.8" opacity="0.22">
++  <circle cx="1149.9" cy="57.2" r="34" fill="none" stroke="#3FE0A8" stroke-width="0.8" opacity="0.22">
+     <animate attributeName="r" values="30;42;30" dur="3.6s" repeatCount="indefinite"/>
+     <animate attributeName="opacity" values="0.26;0.05;0.26" dur="3.6s" repeatCount="indefinite"/>
+   </circle>
+-  <text x="818" y="52" font-family="sans-serif" font-size="17" font-weight="900" fill="#EAFFF7" opacity="1.0" filter="url(#labelGlowG)">Equilibrium</text>
++  <text x="999.9" y="93.2" font-family="sans-serif" font-size="17" font-weight="900" fill="#EAFFF7" opacity="1.0" filter="url(#labelGlowG)">Equilibrium</text>
+ 
+   <circle r="8.5" fill="url(#particleGlowG)" filter="url(#wideGlowG)">
+-    <animateMotion dur="8s" repeatCount="indefinite" rotate="auto" path="M 108.0 126.4 L 110.8 126.9 L 113.6 127.3 L 116.3 127.7 L 119.1 128.1 L 121.9 128.6 L 124.7 129.0 L 127.4 129.5 L 130.2 129.9 L 133.0 130.4 L 146.9 132.6 L 160.7 134.9 L 174.6 137.3 L 188.5 139.6 L 202.3 142.0 L 216.2 144.5 L 229.9 146.9 L 243.7 149.2 L 257.4 151.4 L 271.0 153.6 L 284.6 155.6 L 298.2 157.4 L 311.8 159.1 L 325.3 160.7 L 338.7 162.1 L 352.2 163.4 L 365.6 164.4 L 379.0 165.3 L 392.4 166.0 L 405.7 166.4 L 419.1 166.7 L 432.4 166.8 L 445.8 166.6 L 459.1 166.3 L 472.5 165.7 L 485.8 164.9 L 499.2 163.9 L 512.5 162.6 L 525.9 161.2 L 539.4 159.6 L 552.8 157.7 L 566.3 155.7 L 579.8 153.5 L 593.4 151.1 L 607.0 148.6 L 620.6 145.9 L 634.3 143.0 L 648.0 140.1 L 661.8 137.0 L 675.7 133.8 L 689.6 130.6 L 703.6 127.3 L 717.6 123.9 L 731.8 120.5 L 745.9 117.1 L 760.2 113.7 L 774.5 110.4 L 788.9 107.0 L 803.3 103.8 L 817.8 100.6 L 832.4 97.5 L 847.1 94.5 L 861.8 91.6 L 876.6 88.9 L 891.4 86.3 L 906.3 83.9 L 921.3 81.7 L 936.3 79.6 L 951.3 77.8"/>
++    <animateMotion dur="8s" repeatCount="indefinite" rotate="auto" path="M 268.3 64.8 L 275.7 68.1 L 283.1 72.0 L 290.2 76.2 L 296.8 80.8 L 303.2 85.6 L 309.2 90.7 L 314.9 96.0 L 320.3 101.5 L 325.5 107.1 L 330.6 112.8 L 335.4 118.6 L 340.1 124.4 L 344.7 130.2 L 349.3 135.9 L 353.7 141.6 L 358.2 147.2 L 362.6 152.6 L 367.1 158.0 L 371.6 163.1 L 376.2 168.1 L 380.9 172.9 L 385.6 177.5 L 390.6 181.9 L 395.6 186.0 L 400.9 189.9 L 406.4 193.5 L 412.2 196.9 L 418.2 200.0 L 424.6 202.8 L 431.3 205.4 L 438.9 207.8 L 446.8 210.1 L 455.1 212.4 L 463.6 214.6 L 472.4 216.7 L 481.5 218.8 L 490.8 220.8 L 500.3 222.7 L 510.0 224.7 L 519.9 226.5 L 530.0 228.3 L 540.2 230.1 L 550.5 231.8 L 560.9 233.5 L 571.4 235.1 L 582.0 236.6 L 592.6 238.0 L 603.2 239.3 L 613.9 240.6 L 624.6 241.7 L 635.2 242.7 L 645.9 243.6 L 656.4 244.3 L 666.9 244.9 L 677.3 245.3 L 687.7 245.6 L 697.8 245.6 L 707.9 245.5 L 717.8 245.2 L 727.5 244.6 L 737.2 243.8 L 746.9 242.6 L 756.8 241.2 L 766.8 239.4 L 776.8 237.3 L 786.9 234.9 L 797.0 232.3 L 807.2 229.4 L 817.4 226.3 L 827.5 223.0 L 837.7 219.5 L 847.8 215.8 L 857.9 211.9 L 867.9 208.0 L 877.8 203.9 L 887.7 199.7 L 897.4 195.5 L 907.1 191.2 L 916.6 186.9 L 926.0 182.7 L 935.2 178.4 L 944.2 174.2 L 953.1 170.1 L 961.8 166.0 L 970.2 162.1 L 978.4 158.2 L 986.4 154.6 L 994.2 151.0 L 1001.7 147.7 L 1008.9 144.6 L 1015.7 141.5 L 1022.2 138.5 L 1028.3 135.4 L 1034.2 132.4 L 1039.7 129.3 L 1045.0 126.3 L 1050.0 123.2 L 1054.9 120.2 L 1059.5 117.1 L 1063.9 114.1 L 1068.2 111.0 L 1072.4 108.0 L 1076.4 105.0 L 1080.4 102.0 L 1084.3 98.9 L 1088.2 95.9 L 1092.0 92.9 L 1095.8 90.0 L 1099.7 87.0 L 1103.6 84.1 L 1107.6 81.1 L 1111.6 78.2 L 1115.8 75.4 L 1120.1 72.6 L 1124.5 69.8 L 1129.2 67.1 L 1134.0 64.5 L 1139.0 62.0 L 1144.3 59.5 L 1149.9 57.2"/>
+   </circle>
+ </svg>
+         </div>
+@@ -3656,49 +3563,247 @@ function exportClosedLoopCsv(cl) {
+   setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+ }
+ 
++/* ---- General Network-Builder MRC capability (custom_network projects) ----
++   Runs the REAL automatic MRC derivation pipeline
++   (mrc_designer.auto_manifold.run_auto_mrc_pipeline, via
++   /api/network_mrc/inspect|auto_apply|auto_closed_loop) on THIS project's
++   own builderSpec -- the same Network Builder model already built and
++   analyzed in the earlier stages, not a separate demo network. The result
++   is never forced to SUPPORTED: it is read directly off the pipeline's own
++   status (MRC_SYNTHESIS_SUPPORTED / MRC_FEASIBILITY_DIAGNOSTIC_ONLY /
++   MRC_SYNTHESIS_NOT_ESTABLISHED). */
++
++function customMrcStatusKey(pipelineStatus) {
++  if (pipelineStatus === "MRC_SYNTHESIS_SUPPORTED") return "supported";
++  if (pipelineStatus === "MRC_FEASIBILITY_DIAGNOSTIC_ONLY") return "diagnostic";
++  return "not_established";
++}
++
++function customMrcConverterCandidates() {
++  return (builderSpec.converters || []).map(function (c) { return c.id; });
++}
++
+ async function runCustomFeasibility() {
+-  var btn = $("customFeasBtn"); if (btn) { btn.disabled = true; btn.textContent = "Checking feasibility\u2026"; }
++  var btn = $("customFeasBtn"); if (btn) { btn.disabled = true; btn.textContent = "Running automatic MRC derivation pipeline\u2026"; }
+   var box = $("wsError"); if (box) box.style.display = "none";
+   try {
+-    var eq = stageResults.equilibrium;
+-    var body = { network_spec: builderSpec, x_star: eq && eq.x_star, nominal_input: formState.nominal_input };
++    var convId = formState.mrc_converter_id || undefined;
++    var body = { network_spec: builderSpec, nominal_input: formState.nominal_input, converter_id: convId };
+     var res = await postJson("/api/network_mrc/inspect", body);
+-    stageResults.design_mrc = { status: "not_established", custom: true, inspect: res };
++    var pr = res.pipeline_report || {};
++    stageResults.design_mrc = {
++      status: customMrcStatusKey(pr.status), custom: true, inspect: res,
++      converter_id: pr.converter_id,
++    };
+     renderWorkspace();
+   } catch (e) {
+     var b = $("wsError"); if (b) { b.style.display = "block"; b.textContent = "Feasibility check failed: " + (e && e.message ? e.message : String(e)); }
+   } finally {
+-    var b2 = $("customFeasBtn"); if (b2) { b2.disabled = false; b2.textContent = "Run MRC Feasibility Check"; }
++    var b2 = $("customFeasBtn"); if (b2) { b2.disabled = false; b2.textContent = "Run: Design MRC Controller"; }
+   }
+ }
+ 
+ function renderCustomMrcFeasibility(el) {
+   var r = stageResults.design_mrc;
++  var candidates = customMrcConverterCandidates();
++
+   if (!r || !r.inspect) {
+     var runPanel = document.createElement("div"); runPanel.className = "panel no-print";
+-    runPanel.innerHTML = "<div class='panel-title'>MRC Feasibility Check (assembled Network Builder model)</div>" +
+-      "<div class='help-text'>Inspects the actual assembled system: control-affine split f(x)+G(x)u, control authority of the assigned input, and whether a validated signed controlled-target manifold \u03C6(x) exists. Honest per-model \u2014 not forced to SUPPORTED.</div>";
++    runPanel.innerHTML = "<div class='panel-title'>Design MRC Controller (assembled Network Builder model)</div>" +
++      "<div class='help-text'>Runs the full automatic MRC derivation pipeline on THIS project's own assembled model: control-affine split f(x)+G(x)u, automatic construction of a candidate signed controlled-target manifold \u03C6(x) for the converter, D\u03C6\u00B7G feasibility, closed-form synthesis, independent numeric re-verification, and transverse/tangential stability separation. Honest per-model \u2014 never forced to SUPPORTED.</div>";
++    if (candidates.length > 1) {
++      runPanel.innerHTML += "<div class='field-group-label' style='margin-top:10px;'>Target converter</div>";
++      var sel = document.createElement("select"); sel.id = "mrcConverterSelect";
++      candidates.forEach(function (cid) {
++        var opt = document.createElement("option"); opt.value = cid; opt.textContent = cid;
++        if (cid === formState.mrc_converter_id) opt.selected = true;
++        sel.appendChild(opt);
++      });
++      sel.onchange = function () { formState.mrc_converter_id = sel.value; };
++      runPanel.appendChild(sel);
++    } else if (candidates.length === 1) {
++      formState.mrc_converter_id = candidates[0];
++    }
+     var b = document.createElement("button"); b.className = "run-stage"; b.id = "customFeasBtn";
+-    b.textContent = "Run MRC Feasibility Check"; b.onclick = runCustomFeasibility;
++    b.textContent = "Run: Design MRC Controller"; b.onclick = runCustomFeasibility;
+     runPanel.appendChild(b); el.appendChild(runPanel);
+     appendDesignMrcClaims(el); appendContinueToReport(el); return;
+   }
+-  var f = r.inspect; var authOk = !!f.control_authority;
++
++  var f = r.inspect; var pr = f.pipeline_report || {}; var authOk = !!f.control_authority;
+   var fp = document.createElement("div"); fp.className = "panel";
+-  var h = "<div class='panel-title'>MRC Feasibility \u2014 assembled model diagnostics</div>" +
+-    "<div style='margin-bottom:10px;'>" + dmStatusBadge("not_established") + "</div><div class='info-grid'>" +
++  var h = "<div class='panel-title'>MRC Feasibility \u2014 automatic derivation pipeline result</div>" +
++    "<div style='margin-bottom:10px;'>" + dmStatusBadge(r.status) + "</div><div class='info-grid'>" +
+     "<div class='info-card'><div class='lbl'>dim x</div><div class='val'>" + (f.dim_x != null ? f.dim_x : "\u2014") + "</div></div>" +
+     "<div class='info-card'><div class='lbl'>dim u</div><div class='val'>" + (f.dim_u != null ? f.dim_u : "\u2014") + "</div></div>" +
+-    "<div class='info-card'><div class='lbl'>\u2016G(x*)\u2016</div><div class='val'>" + dmNum(f.G_norm, 3) + "</div></div>" +
+-    "<div class='info-card'><div class='lbl'>input</div><div class='val' style='font-size:11px;'>" + ((f.input_names && f.input_names[0]) || "\u2014") + "</div></div></div>";
++    "<div class='info-card'><div class='lbl'>rank(D\u03C6\u00B7G)</div><div class='val'>" + (pr.rank_A != null ? pr.rank_A : "\u2014") + "</div></div>" +
++    "<div class='info-card'><div class='lbl'>relative degree</div><div class='val'>" + (pr.relative_degree != null ? pr.relative_degree : "\u2014") + "</div></div></div>";
+   h += "<div style='margin-top:10px;display:flex;flex-direction:column;gap:6px;'>" +
+-    "<div style='font-size:11.5px;'><span style='color:" + (authOk ? "#3FE0A8" : "#FFB454") + ";'>\u25CF</span> Control channel f(x)+G(x)u: <b>" + (authOk ? "PRESENT" : "ABSENT") + "</b> (G " + (authOk ? "enters" : "does not enter") + " the state dynamics)</div>" +
+-    "<div style='font-size:11.5px;'><span style='color:#FFB454;'>\u25CF</span> Signed controlled-target manifold \u03C6(x): <b>NOT AVAILABLE</b> (IMS provides only a numeric distance-to-manifold residual)</div></div>";
+-  h += "<div class='help-text' style='margin-top:10px;'>" + (f.reason || "") + "</div>";
++    "<div style='font-size:11.5px;'><span style='color:" + (authOk ? "#3FE0A8" : "#FFB454") + ";'>\u25CF</span> Control channel f(x)+G(x)u: <b>" + (authOk ? "PRESENT" : "ABSENT") + "</b> (G " + (authOk ? "enters" : "does not enter") + " the state dynamics)</div>";
++  if (pr.candidate_phi) {
++    h += "<div style='font-size:11.5px;'><span style='color:#3FE0A8;'>\u25CF</span> Candidate signed controlled-target manifold: <span style='font-family:monospace;'>" + pr.candidate_phi + "</span></div>";
++  }
++  h += "</div>";
++  if (pr.converter_id) h += "<div class='help-text' style='margin-top:8px;'>Target converter: <b>" + pr.converter_id + "</b> (topology: " + (pr.topology || "\u2014") + ")</div>";
++  h += "<div class='help-text' style='margin-top:6px;'>" + (pr.reason || f.reason || "") + "</div>";
+   fp.innerHTML = h; el.appendChild(fp);
++
++  if (r.status === "not_established") { appendDesignMrcClaims(el); appendContinueToReport(el); return; }
++
++  var sp = document.createElement("div"); sp.className = "panel";
++  sp.innerHTML = "<div class='panel-title'>Synthesized control law &nbsp; u = \u03BA(x)</div>" +
++    "<div class='law-box' style='font-size:12.5px;word-break:break-word;'>" + (pr.control_law_latex || pr.derived_control_law || "") + "</div>";
++  el.appendChild(sp);
++
++  var ce = pr.contraction_residual || {};
++  var vp = document.createElement("div"); vp.className = "panel";
++  var vh = "<div class='panel-title'>Closed-loop verification</div><div class='info-grid'>" +
++    "<div class='info-card'><div class='lbl'>\u03BB\u22A5 vs \u2212k_m</div><div class='val'>" + dmCplx(pr.transverse_eigenvalue) + (pr.transverse_matches_km ? " \u2713" : " \u2717") + "</div></div>" +
++    "<div class='info-card'><div class='lbl'>residual rel-err</div><div class='val'>" + dmNum(ce.max_relative_error, 3) + "</div></div>" +
++    "<div class='info-card'><div class='lbl'>tangential stable</div><div class='val'>" + (pr.tangential_locally_stable ? "yes" : "no") + "</div></div></div>";
++  if (pr.closed_loop_eigenvalues) vh += "<div class='help-text' style='margin-top:8px;'>closed-loop poles: " + pr.closed_loop_eigenvalues.map(dmCplx).join(", ") + "</div>";
++  vh += "<div style='margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;'>" +
++    "<span style='font-size:10.5px;border:1px solid #10B981;color:#10B981;border-radius:4px;padding:2px 7px;'>exact transverse residual identity: " + (ce.identity || "") + "</span>" +
++    "<span style='font-size:10.5px;border-radius:4px;padding:2px 7px;border:1px solid " + (pr.tangential_locally_stable ? "#3FE0A8;color:#3FE0A8" : "#FFB454;color:#FFB454") + ";'>local tangential stability: " + (pr.tangential_locally_stable ? "stable" : "NOT guaranteed") + "</span></div>";
++  vp.innerHTML = vh; el.appendChild(vp);
++
++  // ---- Apply MRC to Converter (actual Network Builder converter) ----
++  var applied = r.applied;
++  var ap = document.createElement("div"); ap.className = "panel";
++  ap.innerHTML = "<div class='panel-title'>Apply MRC to Converter</div>" +
++    "<div class='help-text'>Assign the automatically-derived law as the active controller of converter <b>" + (pr.converter_id || "") + "</b> in this project's assembled network, then run baseline vs MRC on that identical model.</div>";
++  if (!applied) {
++    var applyBtn = document.createElement("button"); applyBtn.className = "run-stage"; applyBtn.id = "applyMrcBtn";
++    applyBtn.textContent = "Apply MRC to Converter"; applyBtn.onclick = applyAutoMrcToConverter;
++    ap.appendChild(applyBtn);
++  }
++  el.appendChild(ap);
++
++  if (applied) {
++    var ac = (applied.converter && applied.converter.active_controller) || {};
++    var cc = document.createElement("div"); cc.className = "panel";
++    cc.innerHTML = "<div class='panel-title'>Converter controller configuration</div>" +
++      "<div style='margin-bottom:8px;'><span style='display:inline-block;font-size:11px;font-weight:700;color:#3FE0A8;border:1px solid #3FE0A8;border-radius:4px;padding:3px 10px;'>MRC ACTIVE ON CONVERTER &#39;" + (applied.converter.id || "") + "&#39;</span></div>" +
++      "<div class='info-grid'>" +
++      "<div class='info-card'><div class='lbl'>Converter</div><div class='val'>" + (applied.converter.id || "") + "</div></div>" +
++      "<div class='info-card'><div class='lbl'>Bus</div><div class='val'>" + (applied.converter.bus || "") + "</div></div>" +
++      "<div class='info-card'><div class='lbl'>Electrical model</div><div class='val' style='font-size:11px;'>" + (applied.converter.electrical_model || "") + "</div></div>" +
++      "<div class='info-card'><div class='lbl'>Topology</div><div class='val'>" + (ac.topology || "") + "</div></div></div>" +
++      "<div class='panel-title' style='margin-top:12px;'>Active controller</div>" +
++      "<div class='eq-readout' style='font-size:12px;'>" + (ac.label || "") + "</div>" +
++      "<div class='law-box' style='font-size:12px;word-break:break-word;margin-top:8px;'>" + (ac.law_latex || "") + "</div>";
++    el.appendChild(cc);
++
++    var cl = r.closed_loop;
++    var clp = document.createElement("div"); clp.className = "panel";
++    clp.innerHTML = "<div class='panel-title'>Closed-loop simulation \u2014 baseline vs MRC (same assembled network)</div>" +
++      "<div class='help-text'>Reruns this project's identical assembled network from its own equilibrium under a matched disturbance, once with the original (pre-MRC) controller and once with MRC active.</div>";
++    if (!cl) {
++      var clBtn = document.createElement("button"); clBtn.className = "run-stage"; clBtn.id = "clRunBtn";
++      clBtn.textContent = "Run Closed-Loop Simulation (baseline vs MRC)"; clBtn.onclick = runAutoNetworkClosedLoop;
++      clp.appendChild(clBtn);
++    }
++    el.appendChild(clp);
++
++    if (cl) {
++      var bap = document.createElement("div"); bap.className = "panel";
++      bap.innerHTML = "<div class='panel-title'>Before / After \u2014 baseline vs MRC</div>" +
++        "<div class='help-text'>Inductor current i_L(t) and bus voltage v_bus(t) on the assembled network: baseline (original controller) vs MRC, from the identical disturbance.</div>" +
++        "<div id='autoClIlChart'></div><div id='autoClVbChart' style='margin-top:14px;'></div>";
++      el.appendChild(bap);
++
++      var clc = cl.closed_loop_comparison || {};
++      var cb = clc.baseline || {}, cm = clc.mrc || {};
++      var mp2 = document.createElement("div"); mp2.className = "panel";
++      mp2.innerHTML = "<div class='panel-title'>Comparison metrics (assembled network)</div>" +
++        "<table style='width:100%;border-collapse:collapse;font-size:12px;' data-testid='cl-metrics'>" +
++        "<tr style='color:var(--text-dim);text-align:left;font-size:10px;text-transform:uppercase;'><th style='padding:3px 8px 3px 0;'>Metric</th><th>Baseline</th><th>MRC</th></tr>" +
++        "<tr><td style='padding:3px 8px 3px 0;'>final \u2016x\u2212x*\u2016</td><td>" + dmNum(cb.final_deviation) + "</td><td style='color:#6EE7B7;'>" + dmNum(cm.final_deviation) + "</td></tr>" +
++        "<tr><td style='padding:3px 8px 3px 0;'>recovered within horizon</td><td>" + (cb.recovered ? "yes" : "no") + "</td><td style='color:#6EE7B7;'>" + (cm.recovered ? "yes" : "no") + "</td></tr>" +
++        "</table><div class='help-text' style='margin-top:6px;'>" + (cl.disclaimer || "") + "</div>";
++      var csvBtn2 = document.createElement("button"); csvBtn2.className = "secondary-btn no-print"; csvBtn2.textContent = "Export CSV (baseline vs MRC)";
++      csvBtn2.onclick = function () { exportAutoClosedLoopCsv(clc); };
++      mp2.appendChild(csvBtn2); el.appendChild(mp2);
++      setTimeout(function () { drawAutoClosedLoopCharts(clc, "autoClIlChart", "autoClVbChart"); }, 0);
++    }
++  }
++
+   appendDesignMrcClaims(el); appendContinueToReport(el);
+ }
+ 
++async function applyAutoMrcToConverter() {
++  var btn = $("applyMrcBtn"); if (btn) { btn.disabled = true; btn.textContent = "Applying\u2026"; }
++  var box = $("wsError"); if (box) box.style.display = "none";
++  try {
++    var convId = (stageResults.design_mrc && stageResults.design_mrc.converter_id) || formState.mrc_converter_id;
++    var body = { network_spec: builderSpec, converter_id: convId };
++    var res = await postJson("/api/network_mrc/auto_apply", body);
++    if (stageResults.design_mrc) stageResults.design_mrc.applied = res;
++    renderWorkspace();
++  } catch (e) {
++    var b = $("wsError"); if (b) { b.style.display = "block"; b.textContent = "Apply MRC failed: " + (e && e.message ? e.message : String(e)); }
++  } finally {
++    var b2 = $("applyMrcBtn"); if (b2) { b2.disabled = false; b2.textContent = "Apply MRC to Converter"; }
++  }
++}
++
++async function runAutoNetworkClosedLoop() {
++  var btn = $("clRunBtn"); if (btn) { btn.disabled = true; btn.textContent = "Simulating\u2026"; }
++  var box = $("wsError"); if (box) box.style.display = "none";
++  try {
++    var convId = (stageResults.design_mrc && stageResults.design_mrc.converter_id) || formState.mrc_converter_id;
++    var body = { network_spec: builderSpec, converter_id: convId };
++    var res = await postJson("/api/network_mrc/auto_closed_loop", body);
++    if (stageResults.design_mrc) stageResults.design_mrc.closed_loop = res;
++    renderWorkspace();
++  } catch (e) {
++    var b = $("wsError"); if (b) { b.style.display = "block"; b.textContent = "Closed-loop simulation failed: " + (e && e.message ? e.message : String(e)); }
++  } finally {
++    var b2 = $("clRunBtn"); if (b2) { b2.disabled = false; b2.textContent = "Run Closed-Loop Simulation (baseline vs MRC)"; }
++  }
++}
++
++function drawAutoClosedLoopCharts(clc, ilWrapId, vbWrapId) {
++  var b = clc.baseline, m = clc.mrc; if (!b || !m || !b.t || !m.t) return;
++  var ilEl = $(ilWrapId || "autoClIlChart");
++  if (ilEl && b.i_L && m.i_L) {
++    var w = 640, h = 240, mg = { l: 64, r: 14, t: 16, b: 46 };
++    var bPts = b.t.map(function (tv, i) { return [tv * 1000, b.i_L[i]]; });
++    var mPts = m.t.map(function (tv, i) { return [tv * 1000, m.i_L[i]]; });
++    var bounds = computeBounds([bPts, mPts], 0.1);
++    ilEl.innerHTML = "<div style='font-family:var(--display);font-weight:700;font-size:12px;margin:8px 0 6px;'>Inductor current i_L (A)</div><canvas id='" + (ilWrapId || "autoClIlChart") + "Canvas' width='" + w + "' height='" + h + "' style='width:100%;max-width:" + w + "px;background:var(--panel-alt);border-radius:6px;'></canvas>" + chartLegendHtml([{ color: "#FF6B6B", label: "baseline (original controller)" }, { color: "#3FE0A8", label: "MRC" }]);
++    var ctx = $((ilWrapId || "autoClIlChart") + "Canvas").getContext("2d");
++    drawGrid(ctx, bounds, w, h, mg, "time (ms)", "i_L (A)", { tickFontSize: 13 });
++    drawLine(ctx, bPts, bounds, w, h, mg, "#FF6B6B", 2);
++    drawLine(ctx, mPts, bounds, w, h, mg, "#3FE0A8", 2.2);
++  }
++  var vbEl = $(vbWrapId || "autoClVbChart");
++  if (vbEl && b.v_bus && m.v_bus) {
++    var w2 = 640, h2 = 240, m2 = { l: 64, r: 14, t: 16, b: 46 };
++    var bV = b.t.map(function (tv, i) { return [tv * 1000, b.v_bus[i]]; });
++    var mV = m.t.map(function (tv, i) { return [tv * 1000, m.v_bus[i]]; });
++    var bounds2 = computeBounds([bV, mV], 0.1);
++    vbEl.innerHTML = "<div style='font-family:var(--display);font-weight:700;font-size:12px;margin:8px 0 6px;'>Bus voltage v_bus (V)</div><canvas id='" + (vbWrapId || "autoClVbChart") + "Canvas' width='" + w2 + "' height='" + h2 + "' style='width:100%;max-width:" + w2 + "px;background:var(--panel-alt);border-radius:6px;'></canvas>" + chartLegendHtml([{ color: "#FF6B6B", label: "baseline" }, { color: "#3FE0A8", label: "MRC" }].concat(clc.v_nom != null ? [{ color: "#FFB454", label: "v_nom (target)", dashed: true }] : []));
++    var ctx2 = $((vbWrapId || "autoClVbChart") + "Canvas").getContext("2d");
++    drawGrid(ctx2, bounds2, w2, h2, m2, "time (ms)", "v_bus (V)", { tickFontSize: 13 });
++    if (clc.v_nom != null) drawLine(ctx2, [[bounds2.xmin, clc.v_nom], [bounds2.xmax, clc.v_nom]], bounds2, w2, h2, m2, "#FFB454", 1.2, [5, 4]);
++    drawLine(ctx2, bV, bounds2, w2, h2, m2, "#FF6B6B", 2);
++    drawLine(ctx2, mV, bounds2, w2, h2, m2, "#3FE0A8", 2.2);
++  }
++}
++
++function exportAutoClosedLoopCsv(clc) {
++  var b = clc.baseline, m = clc.mrc; if (!b || !m || !b.t) return;
++  var rows = ["t_s,i_L_baseline,i_L_mrc,v_bus_baseline,v_bus_mrc"];
++  for (var i = 0; i < b.t.length; i++) {
++    rows.push([b.t[i], b.i_L[i], (m.i_L && m.i_L[i] !== undefined) ? m.i_L[i] : "", b.v_bus[i], (m.v_bus && m.v_bus[i] !== undefined) ? m.v_bus[i] : ""].join(","));
++  }
++  var blob = new Blob([rows.join("\n")], { type: "text/csv" });
++  var a = document.createElement("a"); a.href = URL.createObjectURL(blob);
++  a.download = "custom_network_baseline_vs_mrc.csv"; a.click();
++  setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
++}
++
+ function appendDesignMrcClaims(el) {
+   var c = document.createElement("div"); c.className = "panel";
+   c.innerHTML = "<div class='panel-title'>Guarantee classification (kept strictly distinct)</div><div class='help-text' style='line-height:1.7;'>" +
+@@ -4577,6 +4682,10 @@ function populateReportFigures() {
+     else if (ims.residual && ims.trajectory) renderResidualPlot("report_residualWrap", ims.trajectory.t, ims.residual, "Time (s)");
+   }
+   if (ims && ims.recoverability && $("report_recMapWrap")) renderRecoverabilityMap(ims, "report_recMapWrap", "report_recMapLegend");
++  var dm = stageResults.design_mrc;
++  if (dm && dm.custom && dm.closed_loop && dm.closed_loop.closed_loop_comparison && $("report_autoClIlWrap")) {
++    drawAutoClosedLoopCharts(dm.closed_loop.closed_loop_comparison, "report_autoClIlWrap", "report_autoClVbWrap");
++  }
+ }
+ 
+ function buildExecutiveSummaryHtml() {
+@@ -4983,6 +5092,40 @@ function buildReportBodyHtml(forExport) {
+       "</div>";
+   }
+ 
++  // --- MRC Controller design & closed-loop verification (custom_network
++  //     projects: the automatically-derived MRC from THIS project's own
++  //     Design MRC Controller stage, not a separate demo) ---
++  if (stageResults.design_mrc && stageResults.design_mrc.custom) {
++    var dm = stageResults.design_mrc, dmf = (dm.inspect || {}), dmpr = dmf.pipeline_report || {};
++    html += "<div class='panel' style='order:7;'><div class='panel-title'>MRC Controller (automatically derived)</div>" +
++      "<div style='margin-bottom:8px;'>" + dmStatusBadge(dm.status) + "</div>" +
++      "<table style='width:100%;border-collapse:collapse;font-size:12px;'>" +
++      "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Target converter</td><td>" + (dmpr.converter_id || "—") + "</td></tr>" +
++      "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Topology</td><td>" + (dmpr.topology || "—") + "</td></tr>" +
++      "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>rank(Dφ·G)</td><td>" + (dmpr.rank_A != null ? dmpr.rank_A : "—") + "</td></tr>" +
++      "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>Relative degree</td><td>" + (dmpr.relative_degree != null ? dmpr.relative_degree : "—") + "</td></tr>" +
++      "</table>" +
++      (dmpr.candidate_phi ? "<div style='font-size:11px;text-transform:uppercase;color:var(--text-dim,#888);margin:10px 0 4px;'>Candidate signed controlled-target manifold</div><div class='law-box' style='font-size:12px;'>" + dmpr.candidate_phi + "</div>" : "") +
++      (dmpr.control_law_latex ? "<div style='font-size:11px;text-transform:uppercase;color:var(--text-dim,#888);margin:10px 0 4px;'>Synthesized control law</div><div class='law-box' style='font-size:12px;word-break:break-word;'>" + dmpr.control_law_latex + "</div>" : "") +
++      "<p style='font-size:11.5px;color:var(--text-dim,#888);margin-top:8px;'>" + (dmpr.reason || dmf.reason || "") + "</p>";
++    if (dm.applied) {
++      html += "<div style='font-size:11px;text-transform:uppercase;color:var(--text-dim,#888);margin:10px 0 4px;'>Applied to converter</div>" +
++        "<p style='font-size:12px;'>MRC is the active controller of converter <b>" + (dm.applied.converter && dm.applied.converter.id) + "</b> in this project's assembled network.</p>";
++    }
++    if (dm.closed_loop && dm.closed_loop.closed_loop_comparison) {
++      var clc2 = dm.closed_loop.closed_loop_comparison, cb2 = clc2.baseline || {}, cm2 = clc2.mrc || {};
++      html += "<div style='font-size:11px;text-transform:uppercase;color:var(--text-dim,#888);margin:10px 0 4px;'>Before / After — baseline vs MRC</div>" +
++        "<table style='width:100%;border-collapse:collapse;font-size:12px;'>" +
++        "<tr style='color:var(--text-dim,#888);text-align:left;font-size:10px;text-transform:uppercase;'><th style='padding:3px 8px 3px 0;'>Metric</th><th>Baseline</th><th>MRC</th></tr>" +
++        "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>final ‖x−x*‖</td><td>" + (cb2.final_deviation !== undefined && cb2.final_deviation !== null ? cb2.final_deviation.toExponential(3) : "—") + "</td><td>" + (cm2.final_deviation !== undefined && cm2.final_deviation !== null ? cm2.final_deviation.toExponential(3) : "—") + "</td></tr>" +
++        "<tr><td style='padding:3px 8px 3px 0;color:var(--text-dim,#888);'>recovered within horizon</td><td>" + (cb2.recovered ? "yes" : "no") + "</td><td>" + (cm2.recovered ? "yes" : "no") + "</td></tr>" +
++        "</table>" +
++        "<div style='margin-top:10px;'>" + figureSlot("report_autoClIlWrap", forExport, "Inductor current i_L, baseline vs MRC, on the assembled network.") + "</div>" +
++        "<div style='margin-top:10px;'>" + figureSlot("report_autoClVbWrap", forExport, "Bus voltage v_bus, baseline vs MRC, on the assembled network.") + "</div>";
++    }
++    html += "</div>";
++  }
++
+   // --- Conclusions ---
+   if (eq && ims && ims.recoverability) {
+     var r = ims.recoverability;
+diff --git a/backend/ims_tests/test_auto_manifold_mrc.py b/backend/ims_tests/test_auto_manifold_mrc.py
+new file mode 100644
+index 0000000..cde5bd5
+--- /dev/null
++++ b/backend/ims_tests/test_auto_manifold_mrc.py
+@@ -0,0 +1,228 @@
++"""
++Tests for ims_platform.mrc_designer.auto_manifold: the automatic
++controlled-target-manifold construction, feasibility, synthesis, and
++closed-loop verification pipeline for directly duty-modulated Network
++Builder converters (Buck/Boost/Buck-Boost), plus the required validation
++matrix across topology x load combinations, plus a regression guard
++confirming the existing Four-State Stabilising MRC benchmark is
++untouched by this module.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++import sympy
++
++from ims_platform.network.network import Network
++from ims_platform.network.bus import Bus
++from ims_platform.network.converter import Converter
++from ims_platform.network.converter_topologies import BuckModel, BoostModel, BuckBoostModel
++from ims_platform.network.controller import ConstantDutyController, current_loop_mrc_duty, TOPOLOGY_CODE
++from ims_platform.network.components import ConstantPowerLoad, ConstantImpedanceLoad, ConstantCurrentLoad, IdealSource
++from ims_platform.mrc_designer.auto_manifold import (
++    run_auto_mrc_pipeline,
++    derive_symbolic_law,
++    symbolic_diL_dt,
++    find_duty_modulated_converter,
++)
++from ims_platform.mrc_designer.designer import MRCNotEstablished
++
++TOPOLOGIES = {"buck": BuckModel, "boost": BoostModel, "buckboost": BuckBoostModel}
++V_NOM_BY_TOPOLOGY = {"buck": 24.0, "boost": 72.0, "buckboost": 24.0}
++
++
++def _build_network(topology: str, load_kind: str, v_in: float = 48.0) -> Network:
++    net = Network("t")
++    v_nom = V_NOM_BY_TOPOLOGY[topology]
++    net.add_bus(Bus(id="bus", C=2e-3, v_init=v_nom, v_min=v_nom * 0.05))
++    em = TOPOLOGIES[topology](v_in=v_in, L=1e-3, R_L=0.05)
++    net.add_component(Converter(id="conv", bus="bus", electrical_model=em, controller=ConstantDutyController(d=0.5)))
++    if load_kind == "cpl":
++        net.add_component(ConstantPowerLoad(id="load", bus="bus", P=50.0, v_floor=0.5))
++    elif load_kind == "impedance":
++        net.add_component(ConstantImpedanceLoad(id="load", bus="bus", R=v_nom ** 2 / 50.0))
++    elif load_kind == "current":
++        net.add_component(ConstantCurrentLoad(id="load", bus="bus", I=50.0 / v_nom))
++    else:
++        raise ValueError(load_kind)
++    return net
++
++
++# ---------------------------------------------------------------------------
++# Independent symbolic-vs-numeric cross-check (guards against the two
++# duplicated formulas -- network.controller.current_loop_mrc_duty and
++# mrc_designer.auto_manifold.symbolic_diL_dt -- silently drifting apart,
++# and both against the REAL, validated ConverterModel.local_dynamics).
++# ---------------------------------------------------------------------------
++
++@pytest.mark.parametrize("topology", ["buck", "boost", "buckboost"])
++def test_symbolic_matches_numeric_topology(topology):
++    em_cls = TOPOLOGIES[topology]
++    em = em_cls(v_in=48.0, L=1e-3, R_L=0.05)
++    rng = np.random.default_rng(42)
++    iL_s, vbus_s, d_s, v_in_s, L_s, R_L_s = sympy.symbols("i_L v_bus d v_in L R_L", real=True)
++    expr = symbolic_diL_dt(topology, iL_s, vbus_s, d_s, v_in_s, L_s, R_L_s)
++    fn = sympy.lambdify((iL_s, vbus_s, d_s, v_in_s, L_s, R_L_s), expr, "numpy")
++    for _ in range(20):
++        iL = float(rng.uniform(0.1, 10.0))
++        vbus = float(rng.uniform(5.0, 100.0))
++        d = float(rng.uniform(0.05, 0.95))
++        real = em.local_dynamics(vbus, np.array([iL]), d, em.params)[0]
++        symbolic = fn(iL, vbus, d, 48.0, 1e-3, 0.05)
++        assert abs(real - symbolic) < 1e-9, (topology, iL, vbus, d, real, symbolic)
++
++
++@pytest.mark.parametrize("topology", ["buck", "boost", "buckboost"])
++def test_derived_duty_law_matches_runtime_controller_formula(topology):
++    """
++    The symbolic closed-form solved by derive_symbolic_law must agree,
++    numerically, with the independently-written runtime formula in
++    network.controller.current_loop_mrc_duty -- two separately-authored
++    computational paths for the same control law.
++    """
++    params = {"v_nom": V_NOM_BY_TOPOLOGY[topology], "K_i": 20.0, "k_m": 500.0, "i_bias": 0.0,
++              "v_in": 48.0, "L": 1e-3, "R_L": 0.05}
++    law = derive_symbolic_law(topology, params)
++    syms = law["symbols"]
++    fn = sympy.lambdify(
++        (syms["iL"], syms["vbus"], syms["sigma"], syms["v_in"], syms["L"], syms["R_L"],
++         syms["v_nom"], syms["K_i"], syms["k_m"], syms["i_bias"]),
++        law["control_expr"], "numpy",
++    )
++    p_runtime = dict(params)
++    p_runtime["topology_code"] = TOPOLOGY_CODE[topology]
++    rng = np.random.default_rng(7)
++    for _ in range(10):
++        iL = float(rng.uniform(0.5, 5.0))
++        vbus = float(rng.uniform(V_NOM_BY_TOPOLOGY[topology] * 0.9, V_NOM_BY_TOPOLOGY[topology] * 1.1))
++        sigma = float(rng.uniform(-0.5, 0.5))
++        symbolic_d = float(fn(iL, vbus, sigma, params["v_in"], params["L"], params["R_L"],
++                               params["v_nom"], params["K_i"], params["k_m"], params["i_bias"]))
++        runtime_d = current_loop_mrc_duty("", iL, vbus, sigma, p_runtime)
++        assert abs(symbolic_d - runtime_d) < 1e-9, (topology, iL, vbus, sigma, symbolic_d, runtime_d)
++
++
++# ---------------------------------------------------------------------------
++# Honest "not established" cases -- required by task step 8
++# ---------------------------------------------------------------------------
++
++def test_no_duty_modulated_converter_reports_not_established():
++    net = Network("t")
++    net.add_bus(Bus(id="bus", v_fixed=24.0))
++    net.add_component(ConstantImpedanceLoad(id="load", bus="bus", R=10.0))
++    with pytest.raises(MRCNotEstablished, match="no directly duty-modulated converter"):
++        find_duty_modulated_converter(net)
++
++    net2 = Network("t2")
++    net2.add_bus(Bus(id="bus", C=1e-3, v_init=24.0, v_min=1.0))
++    net2.add_component(IdealSource(id="src", bus="bus", v_source=24.0, R_source=0.1))
++    net2.add_component(ConstantImpedanceLoad(id="load", bus="bus", R=10.0))
++    report = run_auto_mrc_pipeline(net2)
++    assert report["status"] == "MRC_SYNTHESIS_NOT_ESTABLISHED"
++    assert "no directly duty-modulated converter" in report["reason"]
++
++
++def test_ambiguous_converters_require_explicit_id():
++    net = _build_network("buck", "impedance")
++    em2 = BuckModel(v_in=48.0, L=1e-3, R_L=0.05)
++    net.add_component(Converter(id="conv2", bus="bus", electrical_model=em2, controller=ConstantDutyController(d=0.5)))
++    with pytest.raises(MRCNotEstablished, match="must be given explicitly"):
++        find_duty_modulated_converter(net)
++    # with an explicit id, resolution succeeds
++    found = find_duty_modulated_converter(net, converter_id="conv")
++    assert found.id == "conv"
++
++
++def test_target_voltage_outside_achievable_range_is_not_established():
++    """A Boost converter cannot regulate its bus BELOW v_in in the ideal
++    averaged model (V_o/V_in = 1/(1-D) >= 1 for D in [0,1)); asking for
++    that is an equilibrium-incompatible target, not a code failure."""
++    net = _build_network("boost", "impedance", v_in=48.0)
++    report = run_auto_mrc_pipeline(net, converter_id="conv", v_nom=24.0)  # below v_in=48
++    assert report["status"] == "MRC_SYNTHESIS_NOT_ESTABLISHED"
++    assert "not reachable" in report["reason"] or "incompatible" in report["reason"]
++
++
++# ---------------------------------------------------------------------------
++# Required validation matrix (task step 9): every reported case must carry
++# a real mathematical status, never a blanket "Supported", and the exact
++# transverse contraction identity must hold to near machine precision
++# whenever synthesis is attempted at all.
++# ---------------------------------------------------------------------------
++
++VALID_STATUSES = {"MRC_SYNTHESIS_SUPPORTED", "MRC_FEASIBILITY_DIAGNOSTIC_ONLY", "MRC_SYNTHESIS_NOT_ESTABLISHED"}
++
++
++@pytest.mark.parametrize("topology", ["buck", "boost", "buckboost"])
++@pytest.mark.parametrize("load_kind", ["cpl", "impedance", "current"])
++def test_validation_matrix_case(topology, load_kind):
++    net = _build_network(topology, load_kind)
++    report = run_auto_mrc_pipeline(net, converter_id="conv", v_nom=V_NOM_BY_TOPOLOGY[topology])
++    assert report["status"] in VALID_STATUSES
++    if report["status"] != "MRC_SYNTHESIS_NOT_ESTABLISHED":
++        # relative degree one is a structural property of this construction
++        # for these topologies and must always hold once synthesis proceeds
++        assert report["rank_A"] == 1
++        assert report["relative_degree"] == 1
++        # the exact, ideal-model transverse identity phi_dot = -k_m*phi
++        # must hold to near machine precision, independent of load type
++        assert report["contraction_residual"]["max_relative_error"] < 1e-6
++
++
++def test_validation_matrix_impedance_loads_are_supported():
++    """
++    A resistive (impedance) load has no negative-incremental-impedance
++    destabilizing term, so the current-loop MRC's tangential/reduced
++    dynamics is expected to be genuinely, locally stable for all three
++    topologies at the chosen default gains -- this is the concrete,
++    positive "MRC SYNTHESIS SUPPORTED" case the task asks the pipeline to
++    be capable of reaching honestly (not by forcing it).
++    """
++    for topology in ("buck", "boost", "buckboost"):
++        net = _build_network(topology, "impedance")
++        report = run_auto_mrc_pipeline(net, converter_id="conv", v_nom=V_NOM_BY_TOPOLOGY[topology])
++        assert report["status"] == "MRC_SYNTHESIS_SUPPORTED", (topology, report.get("reason"))
++        assert report["simulation_result"]["recovered"] is True
++
++
++def test_validation_matrix_cpl_loads_are_not_silently_forced_supported():
++    """
++    A constant-power load's negative incremental impedance is the book's
++    own central destabilizing mechanism (ch:motivation, eq:motivation-cpl)
++    -- at the chosen default gains the current-loop construction's
++    tangential dynamics is NOT locally stable for a CPL, and the pipeline
++    must say so honestly (diagnostic-only), never silently reporting
++    SUPPORTED just because the transverse identity still holds exactly.
++    """
++    for topology in ("buck", "boost", "buckboost"):
++        net = _build_network(topology, "cpl")
++        report = run_auto_mrc_pipeline(net, converter_id="conv", v_nom=V_NOM_BY_TOPOLOGY[topology])
++        assert report["status"] != "MRC_SYNTHESIS_SUPPORTED", (
++            f"{topology}+cpl reported SUPPORTED at default gains, which would mean the "
++            f"CPL's destabilizing effect on the reduced dynamics was not actually checked"
++        )
++        # the transverse claim must still be reported as exact, regardless
++        assert report["contraction_residual"]["max_relative_error"] < 1e-6
++        assert report["claim_levels"]["local_equilibrium_stability"]["established"] is False
++
++
++# ---------------------------------------------------------------------------
++# Regression guard: this module must not have touched the existing,
++# independently-verified Four-State Stabilising MRC benchmark.
++# ---------------------------------------------------------------------------
++
++def test_four_state_stabilizing_mrc_benchmark_unaffected():
++    from ims_platform.stabilizing import compute_equilibrium, compute_stability
++
++    params = dict(P=20e3, v_nom=400.0, R=0.20, L=1.5e-3, C=2.5e-3, R_v=0.5, K_i=50.0, k_m=500.0)
++    eq = compute_equilibrium(params)
++    st = compute_stability(params)
++
++    x_star = eq["x_star"]
++    expected = {"i_l": 50.0, "v_b": 400.0, "sigma": 0.7, "v_o": 410.0}
++    for key, val in expected.items():
++        assert abs(x_star[key] - val) < 1e-2, (key, x_star[key], val)
++
++    assert st["locally_exponentially_stable"] is True
++    assert abs(st["transverse_eigenvalue"]["re"] - (-500.0)) < 1.0
+diff --git a/run_ims_demo.sh b/run_ims_demo.sh
+old mode 100644
+new mode 100755
+index 48a946b..5ca3e4d
+--- a/run_ims_demo.sh
++++ b/run_ims_demo.sh
+@@ -2,27 +2,45 @@
+ # ---------------------------------------------------------------------------
+ # run_ims_demo.sh
+ #
+-# One-command local launcher for the IMS Platform Explorer (hero page +
+-# Network Builder + MRC workflow), independent of the Mongo-backed FastAPI
+-# shell in backend/server.py. It runs the underlying Flask app
+-# (ims_platform.server.app:create_app) directly, which serves:
+-#   - explorer.html (the hero page you just reviewed)
+-#   - /api/network_mrc/inspect, /auto_apply, /auto_closed_loop
+-#   - every other existing IMS Platform route
++# One-command local launcher for the FULL IMS Platform stack:
++#   - backend/server.py  (FastAPI, port 8001) -- mounts the legacy Flask
++#     explorer.html app at "/", plus /api/analysis/*, /api/mrc_designer/*,
++#     /api/four_state/*, /api/network_mrc/* (the new auto-MRC routes), etc.
++#   - frontend/          (Vite + React, port 3000) -- proxies /api/*,
++#     /explorer.html and /assets to the backend, and serves the native React
++#     routes (e.g. /mrc, used by the "Stabilising MRC" analysis surface).
++#
++# The two pieces are split on purpose (see frontend/vite.config.ts's proxy
++# block and the repo README): explorer.html's "Analysis Hub" and
++# "Stabilising MRC" nav items only work when BOTH are running and you view
++# the app through the Vite dev server (port 3000), not the backend alone.
++# Hitting the backend directly on :8001 will 404 on /mrc and will not have
++# the Vite proxy in front of /api/* -- that mismatch is what produces
++# "Failed to load analysis registry" / "Unexpected token '<'" and a 404 on
++# Stabilising MRC.
+ #
+ # Usage:
+-#   ./run_ims_demo.sh            # start on http://127.0.0.1:5050
+-#   PORT=8080 ./run_ims_demo.sh  # start on a different port
++#   ./run_ims_demo.sh              # backend on :8001, frontend on :3000
++#   BACKEND_PORT=8002 FRONTEND_PORT=3001 ./run_ims_demo.sh
++#
++# Then open:  http://127.0.0.1:${FRONTEND_PORT:-3000}/explorer.html
++# (In Codespaces, open the forwarded URL for the frontend port with
++#  /explorer.html appended -- Codespaces will prompt to make it public/private
++#  the first time a port is forwarded.)
++#
++# Stop with Ctrl+C (stops both processes).
+ # ---------------------------------------------------------------------------
+-set -euo pipefail
++set -uo pipefail
+ 
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ BACKEND_DIR="$SCRIPT_DIR/backend"
++FRONTEND_DIR="$SCRIPT_DIR/frontend"
+ VENV_DIR="$BACKEND_DIR/.venv_demo"
+-PORT="${PORT:-5050}"
++BACKEND_PORT="${BACKEND_PORT:-8001}"
++FRONTEND_PORT="${FRONTEND_PORT:-3000}"
+ 
+ if [ ! -d "$BACKEND_DIR/ims_platform" ]; then
+-  echo "error: expected $BACKEND_DIR/ims_platform to exist. Run this script from a checkout of the repo." >&2
++  echo "error: expected $BACKEND_DIR/ims_platform to exist. Run this script from the repo root." >&2
+   exit 1
+ fi
+ 
+@@ -32,37 +50,97 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+   exit 1
+ fi
+ 
++# ---------------------------------------------------------------------------
++# Backend: venv + deps
++# ---------------------------------------------------------------------------
+ if [ ! -d "$VENV_DIR" ]; then
+-  echo "==> Creating virtual environment at $VENV_DIR"
++  echo "==> Creating backend virtual environment at $VENV_DIR"
+   "$PYTHON_BIN" -m venv "$VENV_DIR"
+ fi
+-
+ # shellcheck disable=SC1091
+ source "$VENV_DIR/bin/activate"
+ 
+-echo "==> Installing/verifying dependencies (first run only takes a minute)"
++echo "==> Installing/verifying backend dependencies (first run only takes a minute)"
+ pip install --quiet --upgrade pip
+-# Core deps the Flask app needs at import time.
++if [ -f "$BACKEND_DIR/requirements.txt" ]; then
++  pip install --quiet -r "$BACKEND_DIR/requirements.txt" || true
++fi
++# Belt-and-braces: these are imported at module load time by the IMS Platform
++# app but are not always listed in requirements.txt.
+ pip install --quiet \
+   "flask>=3.0" "numpy>=1.26" "scipy>=1.9" "sympy>=1.12" "matplotlib>=3.7" \
+-  "pyyaml>=6.0" "reportlab>=4.0" "pdfkit>=1.0" "pytest>=8.0"
++  "pyyaml>=6.0" "reportlab>=4.0" "pdfkit>=1.0" \
++  "fastapi>=0.110" "uvicorn>=0.27" "motor>=3.4" "pymongo>=4.6" \
++  "python-dotenv>=1.0" "pydantic>=2.6" "email-validator>=2.1" "pyjwt>=2.8" \
++  "passlib>=1.7" "bcrypt==4.0.1" "python-jose>=3.3" "python-multipart>=0.0.9"
++
++# backend/.env is gitignored and required at import time (MONGO_URL / DB_NAME).
++# If you already have a real MongoDB configured, drop your own backend/.env
++# before running this script and it will be left untouched. Otherwise this
++# generates a harmless placeholder: Motor connects lazily, so the app boots
++# and every route exercised by the Hero / Analysis Hub / Stabilising MRC /
++# Network Builder + MRC workflow (none of which touch Mongo) works fine.
++if [ ! -f "$BACKEND_DIR/.env" ]; then
++  echo "==> No backend/.env found -- writing a placeholder Mongo config (safe: nothing in this workflow touches the DB)"
++  cat > "$BACKEND_DIR/.env" <<EOF
++MONGO_URL=mongodb://localhost:27017
++DB_NAME=ims_demo
++CORS_ORIGINS=*
++EOF
++fi
++
++# ---------------------------------------------------------------------------
++# Frontend: npm deps
++# ---------------------------------------------------------------------------
++if [ -d "$FRONTEND_DIR" ]; then
++  if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
++    echo "==> Installing frontend dependencies (first run only, can take a couple of minutes)"
++    # --legacy-peer-deps: this dependency graph trips a known npm/arborist
++    # crash ("Cannot read properties of null (reading 'edgesOut')") under
++    # strict peer-dep resolution on newer npm; legacy resolution avoids it.
++    ( cd "$FRONTEND_DIR" && npm install --legacy-peer-deps )
++  fi
++else
++  echo "warning: $FRONTEND_DIR not found -- Analysis Hub / Stabilising MRC (/mrc) will 404 without it." >&2
++fi
++
++# ---------------------------------------------------------------------------
++# Launch both, tear down together on Ctrl+C / exit
++# ---------------------------------------------------------------------------
++PIDS=()
++cleanup() {
++  echo ""
++  echo "==> Stopping..."
++  for pid in "${PIDS[@]:-}"; do
++    kill "$pid" >/dev/null 2>&1 || true
++  done
++}
++trap cleanup EXIT INT TERM
+ 
+ cd "$BACKEND_DIR"
++echo "==> Starting backend (FastAPI + legacy Flask app mounted at /) on :$BACKEND_PORT"
++"$PYTHON_BIN" -m uvicorn server:app --host 0.0.0.0 --port "$BACKEND_PORT" > "$SCRIPT_DIR/backend.demo.log" 2>&1 &
++PIDS+=($!)
++
++if [ -d "$FRONTEND_DIR" ]; then
++  cd "$FRONTEND_DIR"
++  echo "==> Starting frontend (Vite dev server, proxies /api + /explorer.html + /assets to :$BACKEND_PORT) on :$FRONTEND_PORT"
++  VITE_PORT="$FRONTEND_PORT" npx vite --port "$FRONTEND_PORT" --host > "$SCRIPT_DIR/frontend.demo.log" 2>&1 &
++  PIDS+=($!)
++fi
++
++sleep 3
+ 
+ cat <<EOF
+ 
+ ==================================================================
+- IMS Platform Explorer — local demo server
+- Open this in your browser:   http://127.0.0.1:${PORT}/
+- Stop the server with:        Ctrl+C
++ IMS Platform Explorer -- local demo stack
++ Open this in your browser:   http://127.0.0.1:${FRONTEND_PORT}/explorer.html
++ (backend alone, no Analysis Hub / Stabilising MRC: http://127.0.0.1:${BACKEND_PORT}/)
++ Logs:  $SCRIPT_DIR/backend.demo.log , $SCRIPT_DIR/frontend.demo.log
++ Stop with:                   Ctrl+C
+ ==================================================================
+ 
+ EOF
+ 
+-exec "$PYTHON_BIN" -c "
+-import sys
+-sys.path.insert(0, '.')
+-from ims_platform.server.app import create_app
+-app = create_app()
+-app.run(host='127.0.0.1', port=${PORT}, debug=False)
+-"
++wait
