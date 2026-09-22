@@ -93,7 +93,7 @@ sandbox.stageResults = {
     recoverability_deterministic: {
       max_residual: 5.0, rms_residual: 0.73, integral_abs_residual: 0.01, final_residual: 2.5,
       recovery_time: null, contraction_rate: 0.05, tolerance_used: 0.1, classification: "Non-Recoverable",
-      ims_conditions: { normal_hyperbolicity: false, exponential_transverse_attraction: true, reduced_dynamics_stable: true, spectral_separation: null, overall_status: "Violated" },
+      ims_conditions: { full_system_local_stability: "VIOLATED", normal_hyperbolicity: "VIOLATED", transverse_contraction: "NOT_ESTABLISHED", reduced_dynamics_stable: "NOT_ESTABLISHED", empirical_finite_horizon_recovery: true, certified_regional_ims: "NOT_ESTABLISHED", overall_status: "VIOLATED" },
       limiting_state: "conv1_ctrl_e_int", limiting_state_deviation: 130.6, limiting_state_location: "component 'conv1'",
       note: "The largest single-state deviation from the nearest intrinsic-manifold point is in component 'conv1' (conv1_ctrl_e_int = +130.6 from its manifold-consistent value).",
       geometric_narrative: "The disturbed state began at a manifold residual of 5. Over the simulated horizon, the residual did not show meaningful contraction toward the intrinsic manifold, settling at a final residual of 2.5 -- exceeding the admissible tolerance of 0.1.",
@@ -144,7 +144,7 @@ check("report includes the real component chain content", reportHtml.indexOf("Bu
 check("report includes the real parameter values, categorized, with units", reportHtml.indexOf("conv_em_v_in") !== -1 && reportHtml.indexOf(">12<") !== -1 && reportHtml.indexOf("Converter Parameters") !== -1 && reportHtml.indexOf(">V<") !== -1);
 check("report includes the recoverability risk badge", reportHtml.indexOf("risk-LOW") !== -1);
 check("report includes the deterministic recoverability classification", reportHtml.indexOf("Recoverable") !== -1 && reportHtml.indexOf("deterministic, manifold-based") !== -1);
-check("report includes the IMS conditions section, correctly showing a real known non-satisfied condition", reportHtml.indexOf("Not satisfied") !== -1 && reportHtml.indexOf("Overall IMS status") !== -1);
+check("report includes the IMS conditions section, correctly showing a real known violated condition", reportHtml.indexOf("Violated") !== -1 && reportHtml.indexOf("Overall IMS status") !== -1);
 check("report includes the limiting-state diagnostic, explicitly labeled as supplementary and not an IMS quantity", reportHtml.indexOf("Supplementary diagnostic (not an IMS quantity)") !== -1 && reportHtml.indexOf("conv1_ctrl_e_int") !== -1);
 check("report includes a geometry-grounded engineering explanation of why the trajectory is/isn't recoverable", reportHtml.indexOf("Geometric interpretation") !== -1 && reportHtml.indexOf("did not show meaningful contraction") !== -1);
 check("report includes an explanation of what the manifold residual represents and why it lacks a universal unit", reportHtml.indexOf("What is the manifold residual?") !== -1 && reportHtml.indexOf("does not carry one universal engineering unit") !== -1);
